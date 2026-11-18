@@ -1740,11 +1740,15 @@ async function start() {
     app.use(vite.middlewares);
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Spotify running at http://0.0.0.0:${PORT} (${isProd ? 'production' : 'development'})`);
-  });
+  if (process.env.VERCEL !== '1') {
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Spotify running at http://0.0.0.0:${PORT} (${isProd ? 'production' : 'development'})`);
+    });
+  }
 }
 
-start();
+if (process.env.VERCEL !== '1') {
+  start();
+}
 
 export default app;
