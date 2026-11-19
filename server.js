@@ -233,6 +233,8 @@ function collectSearchItems(d) {
   return out;
 }
 app.get("/api/home", async (_req, res) => {
+  getSoundCloudClientId(false).catch(() => {
+  });
   try {
     const data = await cached("home_ID_v3", 15 * 60 * 1e3, async () => {
       const [dHome, dCharts, dIdTrend, dIdPop, dIdArtist, dIdPls] = await Promise.all([
@@ -302,10 +304,47 @@ app.get("/api/home", async (_req, res) => {
 });
 app.get("/api/charts", async (_req, res) => {
   try {
-    const data = await cached("charts", 30 * 60 * 1e3, async () => {
-      const d = await yt("browse", { browseId: "FEmusic_charts" });
-      const sl = findFirst(d, "sectionListRenderer");
-      return { sections: sl ? parseSections(sl.contents) : [] };
+    const data = await cached("charts_ID_v2", 20 * 60 * 1e3, async () => {
+      const [dRising, dViral, dGlobalId, dArtists, dPlaylists] = await Promise.all([
+        yt("search", { query: "Lagu Indonesia Lagi Naik Daun Viral Terbaru", params: SEARCH_PARAMS.songs }).catch(() => null),
+        yt("search", { query: "Top 50 Indonesia Trending Hits Spotify", params: SEARCH_PARAMS.songs }).catch(() => null),
+        yt("search", { query: "Lagu Barat Viral di Indonesia TikTok Terbaru", params: SEARCH_PARAMS.songs }).catch(() => null),
+        yt("search", { query: "Penyanyi Band Indonesia Lagi Naik Daun Populer", params: SEARCH_PARAMS.artists }).catch(() => null),
+        yt("search", { query: "Viral 50 Indonesia Top Hits Playlist", params: SEARCH_PARAMS.playlists }).catch(() => null)
+      ]);
+      const seenVids = /* @__PURE__ */ new Set();
+      const pickSongs = (d, limit) => {
+        const out = [];
+        for (const it of collectSearchItems(d)) {
+          if (!it.videoId || seenVids.has(it.videoId)) continue;
+          seenVids.add(it.videoId);
+          out.push(it);
+          if (out.length >= limit) break;
+        }
+        return out;
+      };
+      const sections = [];
+      const risingSongs = pickSongs(dRising, 18);
+      if (risingSongs.length) {
+        sections.push({ title: "Sedang Naik Daun di Indonesia", items: risingSongs, list: true });
+      }
+      const viralSongs = pickSongs(dViral, 15);
+      if (viralSongs.length) {
+        sections.push({ title: "Top Hits & Viral Indonesia Saat Ini", items: viralSongs, list: true });
+      }
+      const risingArtists = collectSearchItems(dArtists).filter((it) => it.type === "artist" || it.browseType === "artist").slice(0, 12);
+      if (risingArtists.length) {
+        sections.push({ title: "Artis Indonesia yang Lagi Naik Daun", items: risingArtists });
+      }
+      const globalInId = pickSongs(dGlobalId, 12);
+      if (globalInId.length) {
+        sections.push({ title: "Lagu Luar yang Lagi Ramai di Indonesia", items: globalInId });
+      }
+      const idPlaylists = collectSearchItems(dPlaylists).filter((it) => it.browseId || it.playlistId).slice(0, 12);
+      if (idPlaylists.length) {
+        sections.push({ title: "Playlist Trending Indonesia", items: idPlaylists });
+      }
+      return { sections };
     });
     res.json(data);
   } catch (e) {
@@ -1066,9 +1105,13 @@ app.get("/api/thumb", async (req, res) => {
   }
 });
 var streamCache = /* @__PURE__ */ new Map();
+var streamInFlight = /* @__PURE__ */ new Map();
+var scUrlCache = /* @__PURE__ */ new Map();
 var scBufferCache = /* @__PURE__ */ new Map();
 var scInFlight = /* @__PURE__ */ new Map();
 var scClientCache = null;
+var scClientInFlight = null;
+var ytStreamBlockedUntil = 0;
 var PLAYER_CLIENTS = [
   {
     clientName: "ANDROID_VR",
@@ -1094,7 +1137,7 @@ async function fetchDirectAudioFromClient(videoId, client) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ videoId, context: { client } })
       },
-      3500
+      1800
     );
     if (!res.ok) return null;
     const data = await res.json();
@@ -1115,54 +1158,99 @@ async function resolveAudioStream(videoId, hq = false, prefer = "mp4", forceRefr
   if (!forceRefresh) {
     const hit = streamCache.get(key);
     if (hit && hit.expiresAt > now + 6e4) return hit;
+    const inflight = streamInFlight.get(key);
+    if (inflight) return inflight;
   }
-  let adaptive = null;
-  const results = await Promise.all(PLAYER_CLIENTS.map((c) => fetchDirectAudioFromClient(videoId, c)));
-  adaptive = results.find((r) => r && r.length) || null;
-  if (!adaptive || !adaptive.length) throw new Error("no direct youtube audio streams");
-  const mp4 = adaptive.filter((f) => f.mimeType.includes("audio/mp4")).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-  const webm = adaptive.filter((f) => f.mimeType.includes("audio/webm")).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-  const all = [...adaptive].sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-  let chosen = null;
-  if (prefer === "webm" && webm.length) {
-    chosen = webm[0];
-  } else if (mp4.length) {
-    chosen = mp4[0];
-  } else {
-    chosen = all[0];
+  const job = (async () => {
+    let adaptive = null;
+    try {
+      adaptive = await Promise.any(
+        PLAYER_CLIENTS.map(async (c) => {
+          const r = await fetchDirectAudioFromClient(videoId, c);
+          if (!r || !r.length) throw new Error("empty");
+          return r;
+        })
+      );
+    } catch {
+      adaptive = null;
+    }
+    if (!adaptive || !adaptive.length) throw new Error("no direct youtube audio streams");
+    const mp4 = adaptive.filter((f) => f.mimeType.includes("audio/mp4")).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+    const webm = adaptive.filter((f) => f.mimeType.includes("audio/webm")).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+    const all = [...adaptive].sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+    let chosen = null;
+    if (prefer === "webm" && webm.length) {
+      chosen = webm[0];
+    } else if (mp4.length) {
+      chosen = mp4[0];
+    } else {
+      chosen = all[0];
+    }
+    const expiresInSec = chosen._expiresInSec || 18e3;
+    const resolvedAt = Date.now();
+    const info = {
+      url: chosen.url,
+      mimeType: String(chosen.mimeType).split(";")[0].trim(),
+      contentLength: chosen.contentLength ? String(chosen.contentLength) : void 0,
+      fetchedAt: resolvedAt,
+      expiresAt: resolvedAt + Math.min(expiresInSec, 7200) * 1e3
+    };
+    streamCache.set(key, info);
+    return info;
+  })();
+  streamInFlight.set(key, job);
+  try {
+    return await job;
+  } finally {
+    if (streamInFlight.get(key) === job) streamInFlight.delete(key);
   }
-  const expiresInSec = chosen._expiresInSec || 18e3;
-  const info = {
-    url: chosen.url,
-    mimeType: String(chosen.mimeType).split(";")[0].trim(),
-    contentLength: chosen.contentLength ? String(chosen.contentLength) : void 0,
-    expiresAt: now + Math.min(expiresInSec, 7200) * 1e3
-  };
-  streamCache.set(key, info);
-  return info;
 }
 async function getSoundCloudClientId(force = false) {
   if (!force && scClientCache && scClientCache.expiresAt > Date.now()) {
     return scClientCache.id;
   }
-  try {
-    const home = await fetchTimeout("https://soundcloud.com", { headers: { "User-Agent": DL_UA } }, 6e3);
-    if (!home.ok) return null;
-    const html = await home.text();
-    const scripts = [...html.matchAll(/src="(https:\/\/a-v2\.sndcdn\.com\/assets\/[^"]+\.js)"/g)].map((m) => m[1]);
-    for (const s of scripts.reverse().slice(0, 6)) {
-      const r = await fetchTimeout(s, { headers: { "User-Agent": DL_UA } }, 5e3);
-      if (!r.ok) continue;
-      const js = await r.text();
-      const m = js.match(/client_id:"([a-zA-Z0-9]{20,40})"/);
-      if (m) {
-        scClientCache = { id: m[1], expiresAt: Date.now() + 6 * 60 * 60 * 1e3 };
-        return m[1];
+  if (!force && scClientInFlight) return scClientInFlight;
+  const job = (async () => {
+    try {
+      const home = await fetchTimeout("https://soundcloud.com", { headers: { "User-Agent": DL_UA } }, 3500);
+      if (!home.ok) return null;
+      const html = await home.text();
+      const scripts = [...html.matchAll(/src="(https:\/\/a-v2\.sndcdn\.com\/assets\/[^"]+\.js)"/g)].map((m) => m[1]);
+      const targets = scripts.reverse().slice(0, 6);
+      if (!targets.length) return null;
+      const found = await Promise.any(
+        targets.map(async (s) => {
+          const r = await fetchTimeout(s, { headers: { "User-Agent": DL_UA } }, 3e3);
+          if (!r.ok) throw new Error("script failed");
+          const js = await r.text();
+          const m = js.match(/client_id:"([a-zA-Z0-9]{20,40})"/);
+          if (!m) throw new Error("no client_id");
+          return m[1];
+        })
+      );
+      if (found) {
+        scClientCache = { id: found, expiresAt: Date.now() + 6 * 60 * 60 * 1e3 };
+        return found;
       }
+    } catch {
     }
-  } catch {
+    return null;
+  })();
+  scClientInFlight = job;
+  try {
+    return await job;
+  } finally {
+    if (scClientInFlight === job) scClientInFlight = null;
   }
-  return null;
+}
+function setScUrlCache(key, entry) {
+  if (scUrlCache.has(key)) scUrlCache.delete(key);
+  scUrlCache.set(key, entry);
+  while (scUrlCache.size > 48) {
+    const oldestKey = scUrlCache.keys().next().value;
+    if (oldestKey) scUrlCache.delete(oldestKey);
+    else break;
+  }
 }
 function setScBufferCache(key, entry) {
   if (scBufferCache.has(key)) scBufferCache.delete(key);
@@ -1215,6 +1303,8 @@ function scoreSoundCloudCandidate(cand, targetTitle, targetArtist, targetDurSec)
     }
   }
   if (cand.policy === "ALLOW") score += 0.3;
+  const hasProg = (cand.media?.transcodings || []).some((tr) => !tr.snipped && tr.format?.protocol === "progressive");
+  if (hasProg) score += 0.45;
   return score;
 }
 async function downloadInBatches(urls, concurrency = 8) {
@@ -1223,7 +1313,7 @@ async function downloadInBatches(urls, concurrency = 8) {
   async function worker() {
     while (idx < urls.length) {
       const i = idx++;
-      const r = await fetchTimeout(urls[i], { headers: { "User-Agent": DL_UA } }, 1e4);
+      const r = await fetchTimeout(urls[i], { headers: { "User-Agent": DL_UA } }, 8e3);
       if (!r.ok) throw new Error(`seg ${i} -> ${r.status}`);
       out[i] = Buffer.from(await r.arrayBuffer());
     }
@@ -1231,13 +1321,19 @@ async function downloadInBatches(urls, concurrency = 8) {
   await Promise.all(Array.from({ length: Math.min(concurrency, urls.length) }, () => worker()));
   return out;
 }
-async function buildSoundCloudAudioBuffer(videoId, rawTitle, rawArtist, rawDurSec = 0) {
-  const cachedEntry = scBufferCache.get(videoId);
-  if (cachedEntry && cachedEntry.expiresAt > Date.now()) {
-    return cachedEntry;
+async function resolveSoundCloudStream(videoId, rawTitle, rawArtist, rawDurSec = 0, forceRefresh = false) {
+  if (!forceRefresh) {
+    const cachedUrl = scUrlCache.get(videoId);
+    if (cachedUrl && cachedUrl.expiresAt > Date.now()) {
+      return { kind: "url", url: cachedUrl.url, mimeType: cachedUrl.mimeType, expiresAt: cachedUrl.expiresAt };
+    }
+    const cachedEntry = scBufferCache.get(videoId);
+    if (cachedEntry && cachedEntry.expiresAt > Date.now()) {
+      return { kind: "buffer", buf: cachedEntry.buf, mimeType: cachedEntry.mimeType, expiresAt: cachedEntry.expiresAt };
+    }
+    const existing = scInFlight.get(videoId);
+    if (existing) return existing;
   }
-  const existing = scInFlight.get(videoId);
-  if (existing) return existing;
   const job = (async () => {
     try {
       let title = displayTitle(cleanTitle(rawTitle) || rawTitle);
@@ -1260,7 +1356,7 @@ async function buildSoundCloudAudioBuffer(videoId, rawTitle, rawArtist, rawDurSe
         let sr = await fetchTimeout(
           `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(q)}&client_id=${cid}&limit=10`,
           { headers: { "User-Agent": DL_UA } },
-          6e3
+          4e3
         );
         if (sr.status === 401 || sr.status === 403) {
           cid = await getSoundCloudClientId(true);
@@ -1268,7 +1364,7 @@ async function buildSoundCloudAudioBuffer(videoId, rawTitle, rawArtist, rawDurSe
           sr = await fetchTimeout(
             `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(q)}&client_id=${cid}&limit=10`,
             { headers: { "User-Agent": DL_UA } },
-            6e3
+            4e3
           );
         }
         if (!sr.ok) continue;
@@ -1291,27 +1387,24 @@ async function buildSoundCloudAudioBuffer(videoId, rawTitle, rawArtist, rawDurSe
         const hlsMp4 = trs.find((tr) => tr.format?.protocol === "hls" && (tr.format?.mime_type || "").includes("audio/mp4"));
         const chosen = prog || hlsMp4;
         if (!chosen) continue;
-        const uRes = await fetchTimeout(`${chosen.url}?client_id=${cid}`, { headers: { "User-Agent": DL_UA } }, 5e3);
+        const uRes = await fetchTimeout(`${chosen.url}?client_id=${cid}`, { headers: { "User-Agent": DL_UA } }, 3500);
         if (!uRes.ok) continue;
         const uJson = await uRes.json();
         if (!uJson.url) continue;
         if (chosen.format?.protocol === "progressive") {
-          const audioRes = await fetchTimeout(uJson.url, { headers: { "User-Agent": DL_UA } }, 2e4);
-          if (!audioRes.ok) continue;
-          const buf = Buffer.from(await audioRes.arrayBuffer());
           const mimeType = (chosen.format?.mime_type || "audio/mpeg").split(";")[0].trim();
-          const entry2 = { buf, mimeType, expiresAt: Date.now() + 40 * 60 * 1e3 };
-          setScBufferCache(videoId, entry2);
-          return entry2;
+          const expiresAt = Date.now() + 25 * 60 * 1e3;
+          setScUrlCache(videoId, { url: uJson.url, mimeType, expiresAt });
+          return { kind: "url", url: uJson.url, mimeType, expiresAt };
         }
-        const m3u8Res = await fetchTimeout(uJson.url, { headers: { "User-Agent": DL_UA } }, 6e3);
+        const m3u8Res = await fetchTimeout(uJson.url, { headers: { "User-Agent": DL_UA } }, 4500);
         if (!m3u8Res.ok) continue;
         const m3u8 = await m3u8Res.text();
         const mapMatch = m3u8.match(/#EXT-X-MAP:URI="([^"]+)"/);
         const segs = m3u8.split("\n").map((l) => l.trim()).filter((l) => l.startsWith("http"));
         if (!segs.length) continue;
         const urls = mapMatch ? [mapMatch[1], ...segs] : segs;
-        const chunks = await downloadInBatches(urls, 8);
+        const chunks = await downloadInBatches(urls, 10);
         const rawBuf = Buffer.concat(chunks);
         const tmpTag = `${videoId}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
         const inPath = path.join(os.tmpdir(), `sp_in_${tmpTag}.mp4`);
@@ -1320,7 +1413,7 @@ async function buildSoundCloudAudioBuffer(videoId, rawTitle, rawArtist, rawDurSe
         try {
           await fs.writeFile(inPath, rawBuf);
           await execFileAsync("ffmpeg", ["-y", "-v", "error", "-i", inPath, "-c", "copy", "-movflags", "+faststart", outPath], {
-            timeout: 1e4
+            timeout: 8e3
           });
           finalBuf = await fs.readFile(outPath);
         } catch {
@@ -1332,13 +1425,13 @@ async function buildSoundCloudAudioBuffer(videoId, rawTitle, rawArtist, rawDurSe
         }
         const entry = { buf: finalBuf, mimeType: "audio/mp4", expiresAt: Date.now() + 40 * 60 * 1e3 };
         setScBufferCache(videoId, entry);
-        return entry;
+        return { kind: "buffer", buf: finalBuf, mimeType: "audio/mp4", expiresAt: entry.expiresAt };
       }
       return null;
     } catch {
       return null;
     } finally {
-      scInFlight.delete(videoId);
+      if (scInFlight.get(videoId) === job) scInFlight.delete(videoId);
     }
   })();
   scInFlight.set(videoId, job);
@@ -1375,6 +1468,33 @@ function serveBufferRange(req, res, buf, mimeType) {
   res.setHeader("Content-Length", String(total));
   return res.send(buf);
 }
+async function proxyUpstreamUrl(req, res, targetUrl, fallbackMime, fallbackLength, signal) {
+  const reqHeaders = { "User-Agent": DL_UA };
+  if (typeof req.headers.range === "string") reqHeaders.Range = req.headers.range;
+  const upstream = await fetch(targetUrl, { headers: reqHeaders, signal });
+  if (!(upstream.ok || upstream.status === 206)) {
+    return upstream.status;
+  }
+  res.status(upstream.status);
+  res.setHeader("Content-Type", upstream.headers.get("content-type") || fallbackMime || "audio/mp4");
+  res.setHeader("Accept-Ranges", "bytes");
+  res.setHeader("Cache-Control", "no-store");
+  const cl = upstream.headers.get("content-length") || fallbackLength;
+  if (cl) res.setHeader("Content-Length", cl);
+  const cr = upstream.headers.get("content-range");
+  if (cr) res.setHeader("Content-Range", cr);
+  if (!upstream.body) {
+    res.end();
+    return upstream.status;
+  }
+  const nodeStream = Readable.fromWeb(upstream.body);
+  nodeStream.on("error", () => {
+    if (!res.headersSent) res.status(502).end();
+    else res.end();
+  });
+  nodeStream.pipe(res);
+  return upstream.status;
+}
 app.get("/api/prefetch", async (req, res) => {
   const videoId = String(req.query.videoId || "");
   if (!/^[\w-]{6,20}$/.test(videoId)) return res.json({ ok: false });
@@ -1383,13 +1503,28 @@ app.get("/api/prefetch", async (req, res) => {
   const title = String(req.query.title || "").trim();
   const artist = String(req.query.artist || "").trim();
   const dur = Number(req.query.dur) || 0;
-  try {
-    await resolveAudioStream(videoId, hq, prefer, false);
-    return res.json({ ok: true, source: "yt" });
-  } catch {
-    const entry = await buildSoundCloudAudioBuffer(videoId, title, artist, dur);
-    return res.json({ ok: !!entry, source: entry ? "sc" : "none" });
+  const key = `${videoId}:${hq ? "hq" : "std"}:${prefer}`;
+  if (ytStreamBlockedUntil <= Date.now() && streamCache.has(key) || scUrlCache.has(videoId) || scBufferCache.has(videoId)) {
+    return res.json({ ok: true, cached: true });
   }
+  if (ytStreamBlockedUntil <= Date.now()) {
+    try {
+      const info = await resolveAudioStream(videoId, hq, prefer, false);
+      const probe = await fetchTimeout(info.url, { headers: { Range: "bytes=0-0" } }, 1500);
+      if (probe.ok || probe.status === 206) {
+        try {
+          probe.body?.cancel();
+        } catch {
+        }
+        return res.json({ ok: true, source: "yt" });
+      }
+      ytStreamBlockedUntil = Date.now() + 3 * 60 * 1e3;
+    } catch {
+      ytStreamBlockedUntil = Date.now() + 3 * 60 * 1e3;
+    }
+  }
+  const entry = await resolveSoundCloudStream(videoId, title, artist, dur);
+  return res.json({ ok: !!entry, source: entry ? "sc" : "none" });
 });
 app.get("/api/stream", async (req, res) => {
   const videoId = String(req.query.videoId || "");
@@ -1399,6 +1534,21 @@ app.get("/api/stream", async (req, res) => {
   const title = String(req.query.title || "").trim();
   const artist = String(req.query.artist || "").trim();
   const dur = Number(req.query.dur) || 0;
+  const cachedScUrl = scUrlCache.get(videoId);
+  if (cachedScUrl && cachedScUrl.expiresAt > Date.now()) {
+    const ac2 = new AbortController();
+    res.on("close", () => {
+      if (!res.writableEnded) ac2.abort();
+    });
+    try {
+      const status = await proxyUpstreamUrl(req, res, cachedScUrl.url, cachedScUrl.mimeType, void 0, ac2.signal);
+      if (status >= 200 && status < 300) return;
+      scUrlCache.delete(videoId);
+    } catch (e) {
+      if (e?.name === "AbortError") return;
+      scUrlCache.delete(videoId);
+    }
+  }
   const cachedSc = scBufferCache.get(videoId);
   if (cachedSc && cachedSc.expiresAt > Date.now()) {
     return serveBufferRange(req, res, cachedSc.buf, cachedSc.mimeType);
@@ -1407,41 +1557,40 @@ app.get("/api/stream", async (req, res) => {
   res.on("close", () => {
     if (!res.writableEnded) ac.abort();
   });
-  try {
-    let info = await resolveAudioStream(videoId, hq, prefer, false);
-    const reqHeaders = {};
-    if (typeof req.headers.range === "string") reqHeaders.Range = req.headers.range;
-    let upstream = await fetch(info.url, { headers: reqHeaders, signal: ac.signal });
-    if (upstream.status === 403 || upstream.status === 410) {
-      info = await resolveAudioStream(videoId, hq, prefer, true);
-      upstream = await fetch(info.url, { headers: reqHeaders, signal: ac.signal });
+  if (!scClientCache || scClientCache.expiresAt <= Date.now()) {
+    getSoundCloudClientId(false).catch(() => {
+    });
+  }
+  if (ytStreamBlockedUntil <= Date.now()) {
+    try {
+      let info = await resolveAudioStream(videoId, hq, prefer, false);
+      let status = await proxyUpstreamUrl(req, res, info.url, info.mimeType, info.contentLength, ac.signal);
+      if (status >= 200 && status < 300) return;
+      if ((status === 403 || status === 410) && Date.now() - info.fetchedAt > 6e4) {
+        info = await resolveAudioStream(videoId, hq, prefer, true);
+        status = await proxyUpstreamUrl(req, res, info.url, info.mimeType, info.contentLength, ac.signal);
+        if (status >= 200 && status < 300) return;
+      }
+      if (status === 403 || status === 410) {
+        ytStreamBlockedUntil = Date.now() + 3 * 60 * 1e3;
+      }
+    } catch (e) {
+      if (e?.name === "AbortError") return;
+      ytStreamBlockedUntil = Date.now() + 3 * 60 * 1e3;
     }
-    if (upstream.ok || upstream.status === 206) {
-      res.status(upstream.status);
-      res.setHeader("Content-Type", upstream.headers.get("content-type") || info.mimeType || "audio/mp4");
-      res.setHeader("Accept-Ranges", "bytes");
-      res.setHeader("Cache-Control", "no-store");
-      const cl = upstream.headers.get("content-length") || info.contentLength;
-      if (cl) res.setHeader("Content-Length", cl);
-      const cr = upstream.headers.get("content-range");
-      if (cr) res.setHeader("Content-Range", cr);
-      if (!upstream.body) return res.end();
-      const nodeStream = Readable.fromWeb(upstream.body);
-      nodeStream.on("error", () => {
-        if (!res.headersSent) res.status(502).end();
-        else res.end();
-      });
-      return nodeStream.pipe(res);
+  }
+  try {
+    const scStream = await resolveSoundCloudStream(videoId, title, artist, dur);
+    if (scStream && !res.writableEnded) {
+      if (scStream.kind === "url") {
+        const status = await proxyUpstreamUrl(req, res, scStream.url, scStream.mimeType, void 0, ac.signal);
+        if (status >= 200 && status < 300) return;
+      } else {
+        return serveBufferRange(req, res, scStream.buf, scStream.mimeType);
+      }
     }
   } catch (e) {
     if (e?.name === "AbortError") return;
-  }
-  try {
-    const scEntry = await buildSoundCloudAudioBuffer(videoId, title, artist, dur);
-    if (scEntry && !res.writableEnded) {
-      return serveBufferRange(req, res, scEntry.buf, scEntry.mimeType);
-    }
-  } catch {
   }
   if (!res.headersSent) res.status(502).json({ error: "stream unavailable" });
 });

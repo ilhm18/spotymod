@@ -317,6 +317,22 @@ body.lib-collapsed #sidebar .lib-box { overflow: hidden; }
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
 }
+.tb-brand {
+  display: none;
+  align-items: center;
+  gap: 9px;
+  color: #fff;
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  flex-shrink: 0;
+}
+.tb-brand img {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  object-fit: cover;
+}
 .tb-nav { display: flex; gap: 8px; flex-shrink: 0; }
 .tb-btn {
   width: 32px; height: 32px; border-radius: 50%;
@@ -1393,7 +1409,15 @@ body.hq-audio #yt-player {
   html, body { height: 100%; overflow: auto; -webkit-overflow-scrolling: touch; }
   #app { padding: 0; gap: 0; height: 100vh; height: 100dvh; overflow: hidden; display: flex; flex-direction: column; }
   #sidebar { display: none; }
-  #topbar { display: none; }
+  #topbar {
+    display: flex;
+    justify-content: space-between;
+    padding: 10px 16px;
+  }
+  .tb-brand { display: flex; }
+  .tb-search-wrap { display: none; }
+  .tb-btn { width: 36px; height: 36px; background: rgba(255, 255, 255, 0.08); }
+  .tb-btn .ic { width: 19px; height: 19px; }
   #main {
     border-radius: 0;
     overflow-y: auto !important;
@@ -1427,7 +1451,7 @@ body.hq-audio #yt-player {
   .pb-buttons { gap: 8px; }
   #mini-shuffle, #mini-repeat { display: none; }
   .play-circle { width: 34px; height: 34px; }
-  #view { padding: 18px 16px 30px; }
+  #view { padding: 10px 16px 30px; }
   .sr-top { flex-direction: row; gap: 14px; padding: 12px; }
   .sr-top img, .art-ph-sr { width: 92px; height: 92px; }
   .sr-title { font-size: 20px; }

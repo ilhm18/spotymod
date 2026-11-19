@@ -319,17 +319,22 @@ function syncMediaSessionPosition() {
   } catch {}
 }
 
-let _prefetchedVid = '';
-let _prefetchTimer = null;
+const _prefetchedVids = new Set();
+function prefetchSong(song) {
+  if (!Player.bgMode || !song || !song.videoId) return;
+  const vid = song.videoId;
+  if (_prefetchedVids.has(vid)) return;
+  if (_prefetchedVids.size >= 40) {
+    const oldest = _prefetchedVids.values().next().value;
+    if (oldest) _prefetchedVids.delete(oldest);
+  }
+  _prefetchedVids.add(vid);
+  fetch(`/api/prefetch?${streamQueryFor(vid, song)}`).catch(() => {});
+}
 function prefetchNextAudio() {
   if (!Player.bgMode) return;
-  clearTimeout(_prefetchTimer);
-  _prefetchTimer = setTimeout(() => {
-    const next = Player.queue[Player.index + 1];
-    if (!next || !next.videoId || next.videoId === _prefetchedVid) return;
-    _prefetchedVid = next.videoId;
-    fetch(`/api/prefetch?${streamQueryFor(next.videoId, next)}`).catch(() => {});
-  }, 1000);
+  prefetchSong(Player.queue[Player.index + 1]);
+  prefetchSong(Player.queue[Player.index + 2]);
 }
 
 let _unlockCtx = null;
@@ -391,8 +396,8 @@ function startAudioTrack(s, startSec = 0, playNow = true) {
   Player._audioRetries = 0;
   const aid = ++Player._audioLoadId;
   bgAudio.loop = false;
+  bgAudio.preload = 'auto';
   bgAudio.src = streamUrlFor(s.videoId, s);
-  bgAudio.load();
   try { bgAudio.playbackRate = Player.speed || 1; } catch {}
   applyVolumeUI();
   syncMediaSessionMetadata(s);
@@ -688,6 +693,7 @@ function queueSong(song, playNext = false) {
     toast('Added to your queue');
   }
   renderQueue();
+  prefetchNextAudio();
 }
 function removeQueued(i) {
   if (i === Player.index || i < 0 || i >= Player.queue.length) return;
@@ -1680,13 +1686,24 @@ function bindEmptyCtas(root) {
 }
 function bindItems(root) {
   $$('.card, .quick-card, .sr-top', root).forEach((el) => {
+    let it;
+    try { it = JSON.parse(el.dataset.item); } catch { it = null; }
+    if (it && it.videoId) {
+      el.addEventListener('pointerdown', () => prefetchSong(songFromItem(it)), { passive: true });
+    }
     el.addEventListener('click', () => {
-      try { openItem(JSON.parse(el.dataset.item)); } catch {}
+      if (it) openItem(it);
     });
   });
   $$('.track', root).forEach((el) => {
     let it;
     try { it = JSON.parse(el.dataset.item); } catch { return; }
+    if (it && it.videoId && !(it.browseId && (it.type === 'album' || it.type === 'playlist' || it.type === 'artist'))) {
+      el.addEventListener('pointerdown', (e) => {
+        if (e.target.closest('.tbtn')) return;
+        prefetchSong(songFromItem(it));
+      }, { passive: true });
+    }
     el.addEventListener('click', (e) => {
       if (e.target.closest('.tbtn')) return;
       if (it.browseId && (it.type === 'album' || it.type === 'playlist' || it.type === 'artist')) openItem(it);
@@ -1771,8 +1788,8 @@ const NAV_DESKTOP = [
 const NAV_MOBILE = [
   { id: 'home', label: 'Home', icon: 'i-home-o', iconActive: 'i-home', hash: '#/home' },
   { id: 'search', label: 'Search', icon: 'i-search', iconActive: 'i-search', hash: '#/search' },
+  { id: 'charts', label: 'Trending', icon: 'i-fire', iconActive: 'i-fire', hash: '#/charts' },
   { id: 'library', label: 'Library', icon: 'i-library', iconActive: 'i-library', hash: '#/library' },
-  { id: 'settings', label: 'Settings', icon: 'i-gear', iconActive: 'i-gear', hash: '#settings' },
 ];
 function renderNav() {
   const navDesktop = $('#nav-desktop');
@@ -2096,6 +2113,10 @@ async function viewHome(view) {
     });
   });
 
+  // Pre-warm top tracks so the very first click plays without cold-start delay
+  const warmList = hist.length ? [...hist.slice(0, 1), ...featuredTracks.slice(0, 2)] : (favs.length ? [...favs.slice(0, 1), ...featuredTracks.slice(0, 2)] : featuredTracks.slice(0, 2));
+  warmList.forEach((s) => prefetchSong(songFromItem(s)));
+
   loadMixForYou();
 }
 
@@ -2318,24 +2339,44 @@ async function viewSearch(view, q = '', filter = null) {
   }
 }
 
-/* ---- Charts ---- */
+/* ---- Trending & Naik Daun Indonesia ---- */
 async function viewCharts(view) {
   view.innerHTML = skeletonHTML;
   const d = await api('/api/charts');
   const dateLine = new Date().toLocaleDateString('id-ID', { weekday: 'long', day: 'numeric', month: 'long' });
   const secs = d.sections || [];
+  const allChartSongs = secs
+    .flatMap((s) => s.items || [])
+    .filter((it) => it && it.videoId);
+
   let body = '';
-  secs.forEach((sec, i) => {
+  secs.forEach((sec) => {
     const items = sec.items || [];
-    if (i === 0 && items.length && items.length <= 6 && items.every(isSearchCard)) {
-      body += `<div class="shelf"><div class="shelf-title">${esc(sec.title)}</div><div class="chart-grid">${items.map(cardHTML).join('')}</div></div>`;
+    if (!items.length) return;
+    if (sec.list) {
+      const ranked = items.map((it, idx) => (it.videoId ? { ...it, tn: idx + 1 } : it));
+      body += `<div class="shelf"><div class="shelf-title">${esc(sec.title)}</div>${trackHeadHTML()}
+        <div class="track-list">${ranked.map((i) => (i.videoId ? trackRowHTML(i) : cardHTML(i))).join('')}</div></div>`;
     } else {
       body += shelfHTML(sec);
     }
   });
-  view.innerHTML = `<div class="hello-row"><div><div class="greeting">${esc(dateLine)}</div><h1 class="page-title">Charts</h1></div></div>`
-    + (body || emptyHTML('No charts right now', 'Try again in a moment.', { label: 'Retry', go: '#/charts', ic: 'i-chart' }));
+
+  view.innerHTML = `<div class="hello-row">
+      <div>
+        <div class="greeting">${esc(dateLine)} · Indonesia</div>
+        <h1 class="page-title">Trending Indonesia</h1>
+      </div>
+      ${allChartSongs.length ? `<button type="button" class="pill-btn primary" id="charts-play-all">${icon('i-play')}<span>Putar Semua</span></button>` : ''}
+    </div>`
+    + (body || emptyHTML('Belum ada data trending', 'Coba muat ulang beberapa saat lagi.', { label: 'Muat ulang', go: '#/charts', ic: 'i-fire' }));
   bindItems(view);
+
+  const playAllBtn = $('#charts-play-all', view);
+  if (playAllBtn && allChartSongs.length) {
+    playAllBtn.addEventListener('click', () => playSong(allChartSongs[0], allChartSongs, 0, 'Trending Indonesia'));
+    allChartSongs.slice(0, 2).forEach((s) => prefetchSong(songFromItem(s)));
+  }
 }
 
 /* Spotify browse-tile palette (fallback when YT colors are missing) */
@@ -3138,6 +3179,7 @@ $('#modal').addEventListener('click', (e) => { if (e.target.id === 'modal') clos
 
 /* ================= wire up controls ================= */
 $('#mini-play').addEventListener('click', (e) => { e.stopPropagation(); togglePlay(); });
+$('#mini-next').addEventListener('pointerdown', prefetchNextAudio, { passive: true });
 $('#mini-next').addEventListener('click', (e) => { e.stopPropagation(); nextTrack(false); });
 $('#mini-prev').addEventListener('click', (e) => { e.stopPropagation(); prevTrack(); });
 $('#mini-like').addEventListener('click', (e) => { e.stopPropagation(); if (Player.current) Library.toggleFav(Player.current); });
@@ -3237,6 +3279,7 @@ $('#mini-bar').addEventListener('click', (e) => {
 });
 $('#np-close').addEventListener('click', closeNowPlaying);
 $('#np-play').addEventListener('click', toggleNowPlayingPlay);
+$('#np-next').addEventListener('pointerdown', prefetchNextAudio, { passive: true });
 $('#np-next').addEventListener('click', () => nextTrack(false));
 $('#np-prev').addEventListener('click', prevTrack);
 $('#np-like').addEventListener('click', () => focusedSong() && Library.toggleFav(focusedSong()));
@@ -3982,6 +4025,8 @@ if (tbSearchInput) {
 }
 const logoHomeBtn = $('#logo-home-btn');
 if (logoHomeBtn) logoHomeBtn.addEventListener('click', () => go('#/home'));
+const tbBrandBtn = $('#tb-brand-btn');
+if (tbBrandBtn) tbBrandBtn.addEventListener('click', () => go('#/home'));
 const plNewSideBtn = $('#pl-new-side-btn');
 if (plNewSideBtn) plNewSideBtn.addEventListener('click', openCreatePlaylist);
 const tbSettingsBtn = $('#tb-settings');
