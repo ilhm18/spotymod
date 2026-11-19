@@ -401,6 +401,7 @@ function startAudioTrack(s, startSec = 0, playNow = true) {
   const aid = ++Player._audioLoadId;
   bgAudio.loop = false;
   bgAudio.src = streamUrlFor(s.videoId, s);
+  bgAudio.load();
   try { bgAudio.playbackRate = Player.speed || 1; } catch {}
   applyVolumeUI();
   syncMediaSessionMetadata(s);

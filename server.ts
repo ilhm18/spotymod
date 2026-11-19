@@ -298,13 +298,14 @@ function collectSearchItems(d: any): any[] {
 
 app.get('/api/home', async (_req: Req, res: Res) => {
   try {
-    const data = await cached('home_ID_v2', 15 * 60 * 1000, async () => {
-      const [dHome, dCharts, dIdTrend, dIdPop, dIdPls] = await Promise.all([
+    const data = await cached('home_ID_v3', 15 * 60 * 1000, async () => {
+      const [dHome, dCharts, dIdTrend, dIdPop, dIdArtist, dIdPls] = await Promise.all([
         yt('browse', { browseId: 'FEmusic_home' }).catch(() => null),
         yt('browse', { browseId: 'FEmusic_charts' }).catch(() => null),
-        yt('search', { query: 'Lagu Indonesia Trending Hits Populer', params: SEARCH_PARAMS.songs }).catch(() => null),
-        yt('search', { query: 'Lagu Pop Indonesia Terbaru Viral', params: SEARCH_PARAMS.songs }).catch(() => null),
-        yt('search', { query: 'Top Hits Indonesia Playlist', params: SEARCH_PARAMS.playlists }).catch(() => null),
+        yt('search', { query: 'Top Hits Indonesia Terbaru Official Chart', params: SEARCH_PARAMS.songs }).catch(() => null),
+        yt('search', { query: 'Lagu Pop Indonesia Viral TikTok Terbaru', params: SEARCH_PARAMS.songs }).catch(() => null),
+        yt('search', { query: 'Artis Indonesia Terpopuler Penyanyi Band', params: SEARCH_PARAMS.artists }).catch(() => null),
+        yt('search', { query: 'Top Hits Indonesia Playlist Spotify', params: SEARCH_PARAMS.playlists }).catch(() => null),
       ]);
 
       const idSections: any[] = [];
@@ -319,7 +320,7 @@ app.get('/api/home', async (_req: Req, res: Res) => {
         if (!it.videoId || seenVids.has(it.videoId)) continue;
         seenVids.add(it.videoId);
         primaryIdSongs.push(it);
-        if (primaryIdSongs.length >= 18) break;
+        if (primaryIdSongs.length >= 20) break;
       }
       if (primaryIdSongs.length) {
         idSections.push({ title: 'Trending & Hits Indonesia', items: primaryIdSongs });
@@ -330,10 +331,15 @@ app.get('/api/home', async (_req: Req, res: Res) => {
         if (!it.videoId || seenVids.has(it.videoId)) continue;
         seenVids.add(it.videoId);
         popSongs.push(it);
-        if (popSongs.length >= 16) break;
+        if (popSongs.length >= 18) break;
       }
       if (popSongs.length) {
-        idSections.push({ title: 'Pop & Viral Indonesia', items: popSongs });
+        idSections.push({ title: 'Pop & Viral Indonesia Terbaru', items: popSongs });
+      }
+
+      const artistsItems = collectSearchItems(dIdArtist).filter((it) => it.type === 'artist' || it.browseType === 'artist').slice(0, 12);
+      if (artistsItems.length) {
+        idSections.push({ title: 'Artis Indonesia Populer', items: artistsItems });
       }
 
       const idPlaylists = collectSearchItems(dIdPls).filter((it) => it.browseId || it.playlistId).slice(0, 12);
@@ -363,9 +369,6 @@ app.get('/api/home', async (_req: Req, res: Res) => {
           n++;
         }
       }
-
-      const topArtistsChart = chartSections.find((s: any) => s.items && s.items.some((x: any) => x.type === 'artist'));
-      if (topArtistsChart) idSections.push(topArtistsChart);
 
       const merged = [...idSections, ...homeSections].filter((s) => s && s.items && s.items.length);
       return { sections: merged };

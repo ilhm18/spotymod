@@ -1375,10 +1375,18 @@ body.hq-audio #yt-player {
   .tb-search { max-width: 280px; }
 }
 @media (max-width: 860px){
-  #app { padding: 0; gap: 0; }
+  html, body { height: 100%; overflow: auto; -webkit-overflow-scrolling: touch; }
+  #app { padding: 0; gap: 0; height: 100vh; height: 100dvh; overflow: hidden; display: flex; flex-direction: column; }
   #sidebar { display: none; }
   #topbar { display: none; }
-  #main { border-radius: 0; }
+  #main {
+    border-radius: 0;
+    overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch;
+    flex: 1;
+    min-height: 0;
+    padding-bottom: calc(var(--navm-h) + var(--player-h) + 64px) !important;
+  }
   :root { --player-h: 64px; }
   .np-handle { display: block; }
   #miniplayer {
