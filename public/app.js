@@ -300,15 +300,6 @@ function syncMediaSessionMetadata(s) {
   setHandler('play', userPlay);
   setHandler('pause', userPause);
   setHandler('stop', userPause);
-  setHandler('seekbackward', (details) => {
-    const skip = (details && details.seekOffset) || 10;
-    seekToSec(Math.max(0, getCurTime() - skip));
-  });
-  setHandler('seekforward', (details) => {
-    const skip = (details && details.seekOffset) || 10;
-    const dur = getDurationSec();
-    seekToSec(dur ? Math.min(dur, getCurTime() + skip) : getCurTime() + skip);
-  });
   setHandler('seekto', (details) => {
     if (!details || typeof details.seekTime !== 'number') return;
     seekToSec(details.seekTime);
