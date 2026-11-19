@@ -868,24 +868,29 @@ function nextTrack(auto) {
     return;
   }
   if (Player.repeat === 2 && auto) { seekToSec(0); userPlay(); return; }
-  if (!Player.queue.length) return;
+  if (!Player.queue.length) {
+    if (Player.current) startCurrent();
+    return;
+  }
   let ni;
   if (Player.shuffle) {
     const userNext = Player.queue.findIndex((q, i) => i > Player.index && q._user);
     if (userNext >= 0) ni = userNext;
     else {
       const others = Player.queue.map((_, i) => i).filter((i) => i !== Player.index);
-      if (!others.length) {
-        if (Player.repeat === 1) ni = Player.index;
-        else return;
-      } else ni = others[Math.floor(Math.random() * others.length)];
+      if (!others.length) ni = 0;
+      else ni = others[Math.floor(Math.random() * others.length)];
     }
   } else ni = Player.index + 1;
+
   if (ni >= Player.queue.length) {
     if (Player.repeat === 1) ni = 0;
-    else return;
+    else {
+      if (Player.current) fetchQueue(Player.current);
+      ni = 0;
+    }
   }
-  Player.index = ni;
+  Player.index = Math.max(0, Math.min(ni, Player.queue.length - 1));
   startCurrent();
 }
 function prevTrack() {
@@ -1766,8 +1771,8 @@ const NAV_DESKTOP = [
 const NAV_MOBILE = [
   { id: 'home', label: 'Home', icon: 'i-home-o', iconActive: 'i-home', hash: '#/home' },
   { id: 'search', label: 'Search', icon: 'i-search', iconActive: 'i-search', hash: '#/search' },
-  { id: 'charts', label: 'Charts', icon: 'i-chart', iconActive: 'i-chart', hash: '#/charts' },
   { id: 'library', label: 'Library', icon: 'i-library', iconActive: 'i-library', hash: '#/library' },
+  { id: 'settings', label: 'Settings', icon: 'i-gear', iconActive: 'i-gear', hash: '#settings' },
 ];
 function renderNav() {
   const navDesktop = $('#nav-desktop');
@@ -1849,6 +1854,10 @@ const go = (hash) => { location.hash = hash; };
 
 async function route() {
   const hash = location.hash || '#/home';
+  if (hash === '#settings') {
+    openSettingsModal();
+    return;
+  }
   const [path, qs] = hash.slice(2).split('?');
   const parts = path.split('/');
   const view = $('#view');
@@ -2022,6 +2031,43 @@ async function viewHome(view) {
 
   // Hero banner interactions
   let activeSlide = 0;
+  const setHeroSlide = (idx) => {
+    activeSlide = (idx + HERO_SLIDES.length) % HERO_SLIDES.length;
+    const sl = HERO_SLIDES[activeSlide] || HERO_SLIDES[0];
+    $$('.hdot', view).forEach((d2, i) => d2.classList.toggle('active', i === activeSlide));
+    const badgeEl = $('.hero-badge-text', view);
+    const titleEl = $('.hero-brand-title', view);
+    const tagEl = $('.hero-tagline', view);
+    if (badgeEl) badgeEl.textContent = sl.badge;
+    if (titleEl) titleEl.textContent = sl.title;
+    if (tagEl) tagEl.textContent = sl.tagline;
+  };
+
+  let heroTimer = setInterval(() => {
+    setHeroSlide(activeSlide + 1);
+  }, 4500);
+
+  const bannerWrap = $('.hero-banner-wrap', view);
+  if (bannerWrap) {
+    bannerWrap.addEventListener('mouseenter', () => clearInterval(heroTimer));
+    bannerWrap.addEventListener('mouseleave', () => {
+      clearInterval(heroTimer);
+      heroTimer = setInterval(() => setHeroSlide(activeSlide + 1), 4500);
+    });
+    let touchStartX = 0;
+    bannerWrap.addEventListener('pointerdown', (e) => {
+      touchStartX = e.clientX;
+    });
+    bannerWrap.addEventListener('pointerup', (e) => {
+      const diff = e.clientX - touchStartX;
+      if (Math.abs(diff) > 35) {
+        if (diff > 0) setHeroSlide(activeSlide - 1);
+        else setHeroSlide(activeSlide + 1);
+      }
+    });
+  }
+  window.addEventListener('hashchange', () => clearInterval(heroTimer), { once: true });
+
   const playHeroBtn = $('#hero-play-btn', view);
   const browseHeroBtn = $('#hero-browse-btn', view);
   if (playHeroBtn) {
@@ -2031,7 +2077,6 @@ async function viewHome(view) {
         playSong(queueSource[0], queueSource, 0, 'Hits Indonesia Mix');
         return;
       }
-      // Fallback: pick first playable Indonesian hit track
       try {
         const res = await api('/api/search?q=Lagu%20Hits%20Indonesia&filter=songs');
         const songs = (res.sections || []).flatMap((s) => s.items || []).filter((i) => i.videoId);
@@ -2047,15 +2092,7 @@ async function viewHome(view) {
   }
   $$('.hdot', view).forEach((dot) => {
     dot.addEventListener('click', () => {
-      activeSlide = Number(dot.dataset.slide) || 0;
-      const sl = HERO_SLIDES[activeSlide] || HERO_SLIDES[0];
-      $$('.hdot', view).forEach((d2, i) => d2.classList.toggle('active', i === activeSlide));
-      const badgeEl = $('.hero-badge-text', view);
-      const titleEl = $('.hero-brand-title', view);
-      const tagEl = $('.hero-tagline', view);
-      if (badgeEl) badgeEl.textContent = sl.badge;
-      if (titleEl) titleEl.textContent = sl.title;
-      if (tagEl) tagEl.textContent = sl.tagline;
+      setHeroSlide(Number(dot.dataset.slide) || 0);
     });
   });
 
