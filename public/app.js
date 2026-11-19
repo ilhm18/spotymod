@@ -168,8 +168,8 @@ const bgAudio = $('#bg-audio');
 const Player = {
   yt: null,
   ready: false,
-  bgMode: store.get('bg_audio', true),
-  engine: 'audio', // 'audio' (native <audio> background stream) | 'yt' (YouTube IFrame fallback)
+  bgMode: store.get('bg_audio_v2', false),
+  engine: 'yt', // 'yt' (instant YouTube IFrame like YT-Music-Mod) | 'audio' (optional screen-off stream)
   _audioLoadId: 0,
   _audioRetries: 0,
   _bgSkipStreak: 0,
@@ -268,7 +268,9 @@ function stopBgAudio() {
   Player._audioLoadId++;
   if (!bgAudio) return;
   try { bgAudio.pause(); } catch {}
-  try { bgAudio.removeAttribute('src'); bgAudio.load(); } catch {}
+  if (bgAudio.getAttribute('src')) {
+    try { bgAudio.removeAttribute('src'); bgAudio.load(); } catch {}
+  }
 }
 function stopYtPlayer() {
   if (Player.yt && Player.ready) { try { Player.yt.pauseVideo(); } catch {} }
@@ -300,6 +302,8 @@ function syncMediaSessionMetadata(s) {
   setHandler('play', userPlay);
   setHandler('pause', userPause);
   setHandler('stop', userPause);
+  setHandler('seekbackward', null);
+  setHandler('seekforward', null);
   setHandler('seekto', (details) => {
     if (!details || typeof details.seekTime !== 'number') return;
     seekToSec(details.seekTime);
@@ -352,7 +356,7 @@ function playYtAt(videoId, startSec = 0, playNow = true) {
   const myLoad = Player.loadId;
   const run = () => {
     if (myLoad !== Player.loadId) return;
-    if (!Player.ready) { setTimeout(run, 250); return; }
+    if (!Player.ready) { setTimeout(run, 40); return; }
     Player.yt.loadVideoById({
       videoId,
       startSeconds: Math.max(0, Number(startSec) || 0),
@@ -574,8 +578,8 @@ function toggleQuality() {
 }
 function toggleBackgroundMode() {
   Player.bgMode = !Player.bgMode;
-  store.set('bg_audio', Player.bgMode);
-  toast(Player.bgMode ? 'Background audio on (screen-off ready)' : 'Background audio off (YouTube IFrame)');
+  store.set('bg_audio_v2', Player.bgMode);
+  toast(Player.bgMode ? 'Mode Layar Mati aktif (Stream Audio)' : 'Mode Instant Play aktif (YouTube IFrame)');
   if (!Player.cued && Player.current) {
     const t = getCurTime();
     const shouldPlay = isPlayingNow() || Player.wantPlay;
@@ -624,13 +628,14 @@ window.onYouTubeIframeAPIReady = () => {
           nextTrack(true);
         }
         if (e.data === YT.PlayerState.PLAYING) {
+          Player.pipResumeTries = 0;
+          if (Player.current) syncMediaSessionMetadata(Player.current);
           setTimeout(maybeRetryLyrics, 600);
           applyPlaybackQuality();
           setTimeout(applyPlaybackQuality, 500);
           setTimeout(applyPlaybackQuality, 2000);
         }
         if (e.data === YT.PlayerState.BUFFERING) applyPlaybackQuality();
-        if (e.data === YT.PlayerState.PLAYING) Player.pipResumeTries = 0;
         document.body.classList.toggle('paused', e.data !== YT.PlayerState.PLAYING);
         renderPlayButtons();
         syncPipVideo(); // keep the system PiP play/pause icon in step with the music
@@ -649,7 +654,15 @@ window.onYouTubeIframeAPIReady = () => {
     },
   });
 };
-(() => { const s = document.createElement('script'); s.src = 'https://www.youtube.com/iframe_api'; document.head.appendChild(s); })();
+(() => {
+  if (window.YT && window.YT.Player && !Player.yt) {
+    window.onYouTubeIframeAPIReady();
+  } else if (!document.querySelector('script[src*="youtube.com/iframe_api"]')) {
+    const s = document.createElement('script');
+    s.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(s);
+  }
+})();
 
 function playSong(song, queue = null, index = null, context = '') {
   if (!song || !song.videoId) return;
@@ -2583,7 +2596,7 @@ function backupLibrary() {
       vol: store.get('vol', 100),
       sb_on: store.get('sb_on', true),
       yt_hq: store.get('yt_hq', false),
-      bg_audio: store.get('bg_audio', true),
+      bg_audio_v2: store.get('bg_audio_v2', false),
     },
   };
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -2633,9 +2646,9 @@ function restoreLibrary() {
             Player.hq = d.settings.yt_hq;
             updateQualityButton();
           }
-          if (typeof d.settings.bg_audio === 'boolean') {
-            store.set('bg_audio', d.settings.bg_audio);
-            Player.bgMode = d.settings.bg_audio;
+          if (typeof d.settings.bg_audio_v2 === 'boolean') {
+            store.set('bg_audio_v2', d.settings.bg_audio_v2);
+            Player.bgMode = d.settings.bg_audio_v2;
           }
         }
         renderSidebarLibrary();
@@ -3984,7 +3997,7 @@ function openSettingsModal() {
   const row = (act, ic, label, on) =>
     `<button type="button" class="modal-row${on ? ' on' : ''}" data-setact="${act}">${icon(ic)}<span>${label}</span></button>`;
   body.innerHTML = `
-    ${row('bg', 'i-radio', Player.bgMode ? 'Background Audio · On (Screen Off Ready)' : 'Background Audio · Off', Player.bgMode)}
+    ${row('bg', 'i-radio', Player.bgMode ? 'Stream Background (Layar Mati) · On' : 'Instant Play Mode (YouTube Direct) · On', Player.bgMode)}
     ${row('autoplay', 'i-radio', Player.autoplay ? 'Autoplay Radio · On' : 'Autoplay Radio · Off', Player.autoplay)}
     ${row('sb', 'i-next', Player.sbEnabled ? 'SponsorBlock Auto-Skip · On' : 'SponsorBlock Auto-Skip · Off', Player.sbEnabled)}
     ${row('hq', 'i-expand', Player.hq ? 'Audio Quality · Max' : 'Audio Quality · Standard', Player.hq)}
