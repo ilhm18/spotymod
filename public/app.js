@@ -168,11 +168,12 @@ const bgAudio = $('#bg-audio');
 const Player = {
   yt: null,
   ready: false,
-  bgMode: store.get('bg_audio_v2', false),
-  engine: 'yt', // 'yt' (instant YouTube IFrame like YT-Music-Mod) | 'audio' (optional screen-off stream)
+  bgMode: store.get('bg_audio_hybrid', true),
+  engine: 'yt', // 'yt' (instant YouTube IFrame) | 'audio' (native <audio> background session)
   _audioLoadId: 0,
   _audioRetries: 0,
   _bgSkipStreak: 0,
+  _bgHandoffPending: false,
   _ytFallbackTried: false,
   queue: [],
   index: -1,
@@ -266,6 +267,7 @@ function setSpeedActive(rate) {
 }
 function stopBgAudio() {
   Player._audioLoadId++;
+  Player._bgHandoffPending = false;
   if (!bgAudio) return;
   try { bgAudio.pause(); } catch {}
   if (bgAudio.getAttribute('src')) {
@@ -396,6 +398,7 @@ function startAudioTrack(s, startSec = 0, playNow = true) {
   unlockMobileAudio();
   stopYtPlayer();
   Player.engine = 'audio';
+  Player._bgHandoffPending = false;
   Player._ytFallbackTried = false;
   Player._audioRetries = 0;
   const aid = ++Player._audioLoadId;
@@ -423,6 +426,44 @@ function startAudioTrack(s, startSec = 0, playNow = true) {
   }
   prefetchNextAudio();
 }
+/* Instant start on YT.Player + parallel <audio> background lock-in inside the user gesture */
+function startHybridTrack(s) {
+  if (!bgAudio || !s || !s.videoId) {
+    stopBgAudio();
+    Player.engine = 'yt';
+    Player._ytFallbackTried = false;
+    playYtAt(s.videoId, 0, true);
+    return;
+  }
+  // If browser/phone is already in background or locked, play directly via <audio>
+  if (document.hidden) {
+    startAudioTrack(s, 0, true);
+    return;
+  }
+  unlockMobileAudio();
+  // 1. Start YouTube IFrame immediately (~150ms, 0 proxy delay)
+  Player.engine = 'yt';
+  Player._ytFallbackTried = false;
+  playYtAt(s.videoId, 0, true);
+
+  // 2. Synchronously prime & authorize <audio> inside the user gesture for seamless background playback
+  const aid = ++Player._audioLoadId;
+  Player._bgHandoffPending = true;
+  Player._audioRetries = 0;
+  try { bgAudio.pause(); } catch {}
+  bgAudio.loop = false;
+  bgAudio.preload = 'auto';
+  try { bgAudio.volume = 0; } catch {}
+  bgAudio.src = streamUrlFor(s.videoId, s);
+  try { bgAudio.playbackRate = Player.speed || 1; } catch {}
+  const p = bgAudio.play();
+  if (p && p.catch) {
+    p.catch(() => {
+      if (aid === Player._audioLoadId) Player._bgHandoffPending = false;
+    });
+  }
+  prefetchNextAudio();
+}
 
 function checkSponsorBlockAt(cur, dur) {
   if (!Player.sbEnabled || !Player.sbSegments.length || !isPlayingNow()) return false;
@@ -440,6 +481,23 @@ function checkSponsorBlockAt(cur, dur) {
 if (bgAudio) {
   let _lastBgPosSync = 0;
   bgAudio.addEventListener('playing', () => {
+    if (Player._bgHandoffPending) {
+      if (!Player.wantPlay || Player.cued || !Player.current) {
+        Player._bgHandoffPending = false;
+        try { bgAudio.pause(); } catch {}
+        return;
+      }
+      const ytTime = (Player.yt && Player.ready && Player.yt.getCurrentTime) ? (Player.yt.getCurrentTime() || 0) : 0;
+      Player._bgHandoffPending = false;
+      Player.engine = 'audio';
+      stopYtPlayer();
+      applyVolumeUI();
+      try { bgAudio.playbackRate = Player.speed || 1; } catch {}
+      const dur = Number.isFinite(bgAudio.duration) ? bgAudio.duration : 0;
+      if (ytTime > 0.35 && (!dur || ytTime < dur - 2)) {
+        try { bgAudio.currentTime = ytTime; } catch {}
+      }
+    }
     if (Player.engine !== 'audio') return;
     Player.pipResumeTries = 0;
     Player._audioRetries = 0;
@@ -493,6 +551,10 @@ if (bgAudio) {
     nextTrack(true);
   });
   bgAudio.addEventListener('error', () => {
+    if (Player._bgHandoffPending) {
+      Player._bgHandoffPending = false;
+      return;
+    }
     if (Player.engine !== 'audio' || !bgAudio.getAttribute('src') || !Player.current) return;
     const s = Player.current;
     const aid = Player._audioLoadId;
@@ -578,8 +640,8 @@ function toggleQuality() {
 }
 function toggleBackgroundMode() {
   Player.bgMode = !Player.bgMode;
-  store.set('bg_audio_v2', Player.bgMode);
-  toast(Player.bgMode ? 'Mode Layar Mati aktif (Stream Audio)' : 'Mode Instant Play aktif (YouTube IFrame)');
+  store.set('bg_audio_hybrid', Player.bgMode);
+  toast(Player.bgMode ? 'Background Audio On (tetap putar di luar web & layar mati)' : 'Background Audio Off (YouTube IFrame saja)');
   if (!Player.cued && Player.current) {
     const t = getCurTime();
     const shouldPlay = isPlayingNow() || Player.wantPlay;
@@ -813,7 +875,7 @@ function startCurrent() {
   Player.wantPlay = true;
   Player.pipResumeTries = 0;
   if (Player.bgMode && bgAudio) {
-    startAudioTrack(s, 0, true);
+    startHybridTrack(s);
   } else {
     stopBgAudio();
     Player.engine = 'yt';
@@ -933,14 +995,19 @@ function userPlay() {
     });
     return;
   }
+  if (Player.bgMode && bgAudio && bgAudio.getAttribute('src')) {
+    Player._bgHandoffPending = true;
+    try { bgAudio.volume = 0; } catch {}
+    bgAudio.play().catch(() => { Player._bgHandoffPending = false; });
+  }
   if (!Player.yt || !Player.ready) return;
   try { Player.yt.playVideo(); } catch {}
 }
 function userPause() {
   Player.wantPlay = false;
-  if (isUsingAudio()) {
+  Player._bgHandoffPending = false;
+  if (bgAudio) {
     try { bgAudio.pause(); } catch {}
-    return;
   }
   if (Player.yt && Player.ready) { try { Player.yt.pauseVideo(); } catch {} }
 }
@@ -2596,7 +2663,7 @@ function backupLibrary() {
       vol: store.get('vol', 100),
       sb_on: store.get('sb_on', true),
       yt_hq: store.get('yt_hq', false),
-      bg_audio_v2: store.get('bg_audio_v2', false),
+      bg_audio_hybrid: store.get('bg_audio_hybrid', true),
     },
   };
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -2646,9 +2713,9 @@ function restoreLibrary() {
             Player.hq = d.settings.yt_hq;
             updateQualityButton();
           }
-          if (typeof d.settings.bg_audio_v2 === 'boolean') {
-            store.set('bg_audio_v2', d.settings.bg_audio_v2);
-            Player.bgMode = d.settings.bg_audio_v2;
+          if (typeof d.settings.bg_audio_hybrid === 'boolean') {
+            store.set('bg_audio_hybrid', d.settings.bg_audio_hybrid);
+            Player.bgMode = d.settings.bg_audio_hybrid;
           }
         }
         renderSidebarLibrary();
@@ -3950,8 +4017,10 @@ function syncPipVideo() {
 const PIP_RESUME_MAX = 20; // ~24s of retries at the 1.2s interval before giving up
 function tryPipResume() {
   if (!Player.wantPlay || !Player.current || Player.cued) return;
-  if (!Player.floatOn && !isUsingAudio()) return;
   if (!isPlayerReadyNow()) return;
+  if (Player.bgMode && bgAudio && Player._bgHandoffPending && bgAudio.paused) {
+    bgAudio.play().catch(() => {});
+  }
   if (isPlayingNow()) { Player.pipResumeTries = 0; return; }
   if (Player.pipResumeTries >= PIP_RESUME_MAX) return;
   Player.pipResumeTries++;
@@ -3959,7 +4028,19 @@ function tryPipResume() {
   else if (Player.yt) { try { Player.yt.playVideo(); } catch {} }
 }
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) Player.pipResumeTries = 0; // fresh budget each time we come back
+  if (!document.hidden) {
+    Player.pipResumeTries = 0; // fresh budget each time we come back
+  } else if (Player.wantPlay && Player.bgMode && bgAudio && Player._bgHandoffPending) {
+    const ytTime = (Player.yt && Player.ready && Player.yt.getCurrentTime) ? (Player.yt.getCurrentTime() || 0) : 0;
+    Player._bgHandoffPending = false;
+    Player.engine = 'audio';
+    stopYtPlayer();
+    applyVolumeUI();
+    if (ytTime > 0.35 && bgAudio.readyState >= 1) {
+      try { bgAudio.currentTime = ytTime; } catch {}
+    }
+    bgAudio.play().catch(() => {});
+  }
   tryPipResume();
 });
 setInterval(() => {
@@ -3997,7 +4078,7 @@ function openSettingsModal() {
   const row = (act, ic, label, on) =>
     `<button type="button" class="modal-row${on ? ' on' : ''}" data-setact="${act}">${icon(ic)}<span>${label}</span></button>`;
   body.innerHTML = `
-    ${row('bg', 'i-radio', Player.bgMode ? 'Stream Background (Layar Mati) · On' : 'Instant Play Mode (YouTube Direct) · On', Player.bgMode)}
+    ${row('bg', 'i-radio', Player.bgMode ? 'Background Audio (Layar Mati / App Lain) · On' : 'Background Audio · Off', Player.bgMode)}
     ${row('autoplay', 'i-radio', Player.autoplay ? 'Autoplay Radio · On' : 'Autoplay Radio · Off', Player.autoplay)}
     ${row('sb', 'i-next', Player.sbEnabled ? 'SponsorBlock Auto-Skip · On' : 'SponsorBlock Auto-Skip · Off', Player.sbEnabled)}
     ${row('hq', 'i-expand', Player.hq ? 'Audio Quality · Max' : 'Audio Quality · Standard', Player.hq)}
