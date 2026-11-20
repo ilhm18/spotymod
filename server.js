@@ -1,5 +1,6 @@
 // server.ts
 import express from "express";
+import crypto from "crypto";
 import { execFile } from "child_process";
 import { promises as fs } from "fs";
 import os from "os";
@@ -14,6 +15,471 @@ var __filename = fileURLToPath(import.meta.url);
 var __dirname = path.dirname(__filename);
 var app = express();
 app.use(express.json());
+var ADMIN_PASSWORD = (process.env.ADMIN_PASSWORD || "admin1234").trim();
+var USING_DEFAULT_ADMIN_PW = !process.env.ADMIN_PASSWORD;
+var TOKEN_SECRET = (process.env.ACCESS_TOKEN_SECRET || crypto.createHash("sha256").update(`spotify-access:${ADMIN_PASSWORD}`).digest("hex")).trim();
+var SUPABASE_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "");
+var SUPABASE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+var HAS_SUPABASE = Boolean(SUPABASE_URL && SUPABASE_KEY);
+var localCodeStore = /* @__PURE__ */ new Map();
+var usedSignedDeviceMap = /* @__PURE__ */ new Map();
+var revokedLocalCodes = /* @__PURE__ */ new Set();
+var codeActiveCache = /* @__PURE__ */ new Map();
+function safeEqualStr(a, b) {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
+function hmacSign(data, len = 24) {
+  return crypto.createHmac("sha256", TOKEN_SECRET).update(data).digest("hex").slice(0, len).toUpperCase();
+}
+function signSessionPayload(payload) {
+  const b64 = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const sig = crypto.createHmac("sha256", TOKEN_SECRET).update(b64).digest("base64url").slice(0, 32);
+  return `${b64}.${sig}`;
+}
+function verifySessionToken(token) {
+  if (!token || typeof token !== "string") return null;
+  const dot = token.indexOf(".");
+  if (dot <= 0) return null;
+  const b64 = token.slice(0, dot);
+  const sig = token.slice(dot + 1);
+  if (!b64 || !sig) return null;
+  const expected = crypto.createHmac("sha256", TOKEN_SECRET).update(b64).digest("base64url").slice(0, 32);
+  if (!safeEqualStr(sig, expected)) return null;
+  try {
+    const obj = JSON.parse(Buffer.from(b64, "base64url").toString("utf8"));
+    if (!obj || typeof obj !== "object") return null;
+    if (typeof obj.exp === "number" && obj.exp > 0 && Date.now() > obj.exp) return null;
+    return obj;
+  } catch {
+    return null;
+  }
+}
+function parseCookies(cookieHeader) {
+  const out = {};
+  if (!cookieHeader) return out;
+  for (const part of cookieHeader.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx <= 0) continue;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    try {
+      out[k] = decodeURIComponent(v);
+    } catch {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+function extractAccessToken(req) {
+  const q = typeof req.query.token === "string" ? req.query.token.trim() : "";
+  if (q) return q;
+  const h = req.headers["x-access-token"];
+  if (typeof h === "string" && h.trim()) return h.trim();
+  const cookies = parseCookies(req.headers.cookie);
+  return cookies.sm_access || "";
+}
+function setAccessCookie(res, token, maxAgeSec = 90 * 24 * 3600) {
+  const isHttps = process.env.NODE_ENV === "production" || process.env.VERCEL === "1";
+  const attrs = [
+    `sm_access=${token ? encodeURIComponent(token) : ""}`,
+    "Path=/",
+    "HttpOnly",
+    isHttps ? "SameSite=None" : "SameSite=Lax",
+    isHttps ? "Secure" : "",
+    token ? `Max-Age=${maxAgeSec}` : "Max-Age=0"
+  ].filter(Boolean);
+  res.setHeader("Set-Cookie", attrs.join("; "));
+}
+function generateSignedCode(expiresAtMs) {
+  const expPart = expiresAtMs ? Math.floor(expiresAtMs / 6e4).toString(36).toUpperCase() : "0";
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let nonce = "";
+  const rnd = crypto.randomBytes(4);
+  for (let i = 0; i < 4; i++) nonce += chars[rnd[i] % chars.length];
+  const sig = hmacSign(`${expPart}:${nonce}`, 8);
+  return `SP1-${expPart}-${nonce}-${sig}`;
+}
+function verifySignedCode(rawCode) {
+  const clean = rawCode.trim().toUpperCase();
+  const m = clean.match(/^SP1-([0-9A-Z]+)-([0-9A-Z]{4})-([0-9A-F]{8})$/);
+  if (!m) return { valid: false, expiresAtMs: null, reason: "format" };
+  const [, expPart, nonce, sig] = m;
+  const expected = hmacSign(`${expPart}:${nonce}`, 8);
+  if (!safeEqualStr(sig, expected)) return { valid: false, expiresAtMs: null, reason: "Kode tidak valid" };
+  if (expPart === "0") return { valid: true, expiresAtMs: null };
+  const expMin = parseInt(expPart, 36);
+  if (!Number.isFinite(expMin) || expMin <= 0) return { valid: false, expiresAtMs: null, reason: "Kode tidak valid" };
+  const expiresAtMs = expMin * 6e4;
+  if (Date.now() > expiresAtMs) return { valid: false, expiresAtMs, reason: "Kode sudah kedaluwarsa" };
+  return { valid: true, expiresAtMs };
+}
+function randomCodeString() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const rnd = crypto.randomBytes(6);
+  let body = "";
+  for (let i = 0; i < 6; i++) body += chars[rnd[i] % chars.length];
+  return `SP-${body}`;
+}
+async function sbFetch(tablePath, init = {}) {
+  const headers = {
+    apikey: SUPABASE_KEY,
+    Authorization: `Bearer ${SUPABASE_KEY}`,
+    "Content-Type": "application/json",
+    ...init.headers || {}
+  };
+  return fetchTimeout(`${SUPABASE_URL}/rest/v1/${tablePath}`, { ...init, headers }, 6e3);
+}
+async function isCodeActiveInSupabase(code) {
+  if (!HAS_SUPABASE || !code) return true;
+  const hit = codeActiveCache.get(code);
+  if (hit && hit.expiresAt > Date.now()) return hit.ok;
+  try {
+    const r = await sbFetch(`access_codes?code=eq.${encodeURIComponent(code)}&select=active,expires_at`);
+    if (!r.ok) return true;
+    const rows = await r.json();
+    const row = Array.isArray(rows) ? rows[0] : null;
+    let ok = false;
+    if (row && row.active) {
+      ok = !row.expires_at || Date.now() <= new Date(row.expires_at).getTime();
+    }
+    codeActiveCache.set(code, { ok, expiresAt: Date.now() + 15e3 });
+    return ok;
+  } catch {
+    return true;
+  }
+}
+async function getValidAccessPayload(req) {
+  const token = extractAccessToken(req);
+  const payload = verifySessionToken(token);
+  if (!payload || payload.role !== "listener") return null;
+  const headerDid = typeof req.headers["x-device-id"] === "string" ? req.headers["x-device-id"].trim() : "";
+  const queryDid = typeof req.query.did === "string" ? req.query.did.trim() : "";
+  const reqDid = headerDid || queryDid;
+  if (payload.did && (!reqDid || !safeEqualStr(String(payload.did), reqDid))) {
+    return null;
+  }
+  const code = String(payload.code || "");
+  if (HAS_SUPABASE && code) {
+    const ok = await isCodeActiveInSupabase(code);
+    if (!ok) return null;
+  } else if (code) {
+    if (revokedLocalCodes.has(code)) return null;
+    const mem = localCodeStore.get(code);
+    if (mem && !mem.active) return null;
+    if (mem && mem.bound_device && reqDid && mem.bound_device !== reqDid) return null;
+  }
+  return payload;
+}
+async function requirePlaybackAccess(req, res) {
+  const payload = await getValidAccessPayload(req);
+  if (payload) return true;
+  res.status(401).json({ error: "locked", message: "Masukkan kode akses untuk memutar lagu" });
+  return false;
+}
+function requireAdminAuth(req, res) {
+  const auth = String(req.headers.authorization || "");
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  const payload = verifySessionToken(token);
+  if (!payload || payload.role !== "admin") {
+    res.status(401).json({ error: "Unauthorized admin" });
+    return false;
+  }
+  return true;
+}
+app.get("/api/access/status", async (req, res) => {
+  const payload = await getValidAccessPayload(req);
+  if (!payload) {
+    return res.json({
+      unlocked: false,
+      lockEnabled: true,
+      storage: HAS_SUPABASE ? "supabase" : "signed"
+    });
+  }
+  return res.json({
+    unlocked: true,
+    lockEnabled: true,
+    label: payload.label || "Akses Aktif",
+    code: payload.code || "",
+    expiresAt: payload.exp || null,
+    storage: HAS_SUPABASE ? "supabase" : "signed"
+  });
+});
+app.post("/api/access/verify", async (req, res) => {
+  try {
+    const rawCode = String(req.body?.code || "").trim().toUpperCase();
+    const rawDid = String(req.body?.deviceId || req.headers["x-device-id"] || "").trim().slice(0, 64);
+    const deviceId = rawDid || crypto.randomBytes(12).toString("hex");
+    if (!rawCode || rawCode.length < 3) {
+      return res.status(400).json({ error: "Masukkan kode akses terlebih dahulu." });
+    }
+    let label = "Akses Premium";
+    let codeExpMs = null;
+    if (HAS_SUPABASE) {
+      const r = await sbFetch(`access_codes?code=eq.${encodeURIComponent(rawCode)}&select=*`);
+      if (!r.ok) {
+        return res.status(502).json({ error: "Gagal memeriksa database kode akses. Cek koneksi Supabase." });
+      }
+      const rows = await r.json();
+      const row = Array.isArray(rows) ? rows[0] : null;
+      if (!row) {
+        return res.status(403).json({ error: "Kode akses tidak ditemukan. Minta kode valid ke Admin." });
+      }
+      if (!row.active) {
+        return res.status(403).json({ error: "Kode akses ini sudah dinonaktifkan oleh Admin." });
+      }
+      if (row.expires_at) {
+        codeExpMs = new Date(row.expires_at).getTime();
+        if (Number.isFinite(codeExpMs) && Date.now() > codeExpMs) {
+          return res.status(403).json({ error: "Kode akses ini sudah kedaluwarsa." });
+        }
+      }
+      const maxUses = Number(row.max_uses) || 0;
+      const uses = Number(row.uses) || 0;
+      const sameBoundDevice = maxUses === 1 && uses >= 1 && "device_id" in row && row.device_id && rawDid && row.device_id === rawDid;
+      if (!sameBoundDevice) {
+        if (maxUses > 0 && uses >= maxUses) {
+          return res.status(403).json({
+            error: maxUses === 1 ? "Kode ini dibatasi 1 perangkat dan sudah digunakan di perangkat lain." : "Batas pemakaian kode ini sudah habis."
+          });
+        }
+        const patchBody = { uses: uses + 1 };
+        if ("device_id" in row && !row.device_id && deviceId) patchBody.device_id = deviceId;
+        const patchRes = await sbFetch(
+          `access_codes?code=eq.${encodeURIComponent(rawCode)}${maxUses > 0 ? `&uses=lt.${maxUses}` : ""}`,
+          {
+            method: "PATCH",
+            headers: { Prefer: "return=representation" },
+            body: JSON.stringify(patchBody)
+          }
+        );
+        if (!patchRes.ok) {
+          return res.status(502).json({ error: "Gagal memperbarui status kode akses." });
+        }
+        const updated = await patchRes.json().catch(() => []);
+        if (maxUses > 0 && (!Array.isArray(updated) || !updated.length)) {
+          return res.status(403).json({
+            error: maxUses === 1 ? "Kode ini dibatasi 1 perangkat dan sudah digunakan di perangkat lain." : "Batas pemakaian kode ini sudah habis."
+          });
+        }
+      }
+      label = row.label || "Akses Aktif";
+      codeActiveCache.set(rawCode, { ok: true, expiresAt: Date.now() + 15e3 });
+    } else {
+      const mem = localCodeStore.get(rawCode);
+      if (mem) {
+        if (!mem.active) {
+          return res.status(403).json({ error: "Kode akses ini sudah dinonaktifkan oleh Admin." });
+        }
+        if (mem.expires_at && Date.now() > new Date(mem.expires_at).getTime()) {
+          return res.status(403).json({ error: "Kode akses ini sudah kedaluwarsa." });
+        }
+        const sameBoundDevice = mem.max_uses === 1 && mem.uses >= 1 && mem.bound_device && rawDid && mem.bound_device === rawDid;
+        if (!sameBoundDevice) {
+          if (mem.max_uses > 0 && mem.uses >= mem.max_uses) {
+            return res.status(403).json({
+              error: mem.max_uses === 1 ? "Kode ini dibatasi 1 perangkat dan sudah digunakan di perangkat lain." : "Batas pemakaian kode ini sudah habis."
+            });
+          }
+          mem.uses += 1;
+          if (!mem.bound_device && deviceId) mem.bound_device = deviceId;
+        }
+        label = mem.label || "Akses Aktif";
+        codeExpMs = mem.expires_at ? new Date(mem.expires_at).getTime() : null;
+      } else {
+        if (revokedLocalCodes.has(rawCode)) {
+          return res.status(403).json({ error: "Kode akses ini sudah dihapus atau dinonaktifkan Admin." });
+        }
+        const signed = verifySignedCode(rawCode);
+        if (!signed.valid) {
+          return res.status(403).json({ error: signed.reason && signed.reason !== "format" ? signed.reason : "Kode akses tidak valid. Hubungi Admin." });
+        }
+        const prevDid = usedSignedDeviceMap.get(rawCode);
+        if (prevDid && (!rawDid || prevDid !== rawDid)) {
+          return res.status(403).json({ error: "Kode ini dibatasi 1 perangkat dan sudah digunakan di perangkat lain." });
+        }
+        if (!prevDid) usedSignedDeviceMap.set(rawCode, deviceId);
+        label = "Kode Akses Resmi";
+        codeExpMs = signed.expiresAtMs;
+      }
+    }
+    const defaultSessionExp = Date.now() + 90 * 24 * 3600 * 1e3;
+    const sessionExp = codeExpMs ? Math.min(codeExpMs, defaultSessionExp) : defaultSessionExp;
+    const token = signSessionPayload({
+      v: 1,
+      role: "listener",
+      code: rawCode,
+      label,
+      did: deviceId,
+      exp: sessionExp
+    });
+    setAccessCookie(res, token, Math.max(60, Math.floor((sessionExp - Date.now()) / 1e3)));
+    return res.json({
+      ok: true,
+      unlocked: true,
+      token,
+      label,
+      code: rawCode,
+      expiresAt: sessionExp,
+      storage: HAS_SUPABASE ? "supabase" : "signed"
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e?.message || "Gagal memverifikasi kode" });
+  }
+});
+app.post("/api/access/lock", (_req, res) => {
+  setAccessCookie(res, null);
+  res.json({ ok: true, unlocked: false });
+});
+app.post("/api/admin/login", (req, res) => {
+  const pw = String(req.body?.password || "").trim();
+  if (!pw || !safeEqualStr(pw, ADMIN_PASSWORD)) {
+    return res.status(401).json({ error: "Password admin salah." });
+  }
+  const exp = Date.now() + 12 * 3600 * 1e3;
+  const adminToken = signSessionPayload({ v: 1, role: "admin", exp });
+  return res.json({
+    ok: true,
+    adminToken,
+    expiresAt: exp,
+    storage: HAS_SUPABASE ? "supabase" : "signed",
+    usingDefaultPassword: USING_DEFAULT_ADMIN_PW
+  });
+});
+app.get("/api/admin/codes", async (req, res) => {
+  if (!requireAdminAuth(req, res)) return;
+  try {
+    if (HAS_SUPABASE) {
+      const r = await sbFetch("access_codes?select=*&order=created_at.desc&limit=100");
+      if (!r.ok) {
+        const errTxt = await r.text().catch(() => "");
+        return res.status(502).json({ error: `Supabase error (${r.status}): ${errTxt || "cek tabel access_codes"}` });
+      }
+      const rows = await r.json();
+      return res.json({
+        storage: "supabase",
+        usingDefaultPassword: USING_DEFAULT_ADMIN_PW,
+        codes: Array.isArray(rows) ? rows : []
+      });
+    }
+    const codes = Array.from(localCodeStore.values()).sort(
+      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    );
+    return res.json({
+      storage: "signed",
+      usingDefaultPassword: USING_DEFAULT_ADMIN_PW,
+      codes
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e?.message || "Gagal memuat daftar kode" });
+  }
+});
+app.post("/api/admin/codes", async (req, res) => {
+  if (!requireAdminAuth(req, res)) return;
+  try {
+    const rawCustom = String(req.body?.code || "").trim().toUpperCase().replace(/[^A-Z0-9_-]/g, "");
+    const label = String(req.body?.label || "").trim().slice(0, 60) || "Pengguna";
+    const maxUses = Math.max(0, Math.min(1e4, Number(req.body?.maxUses ?? 1) || 0));
+    const expiresInDays = Number(req.body?.expiresInDays) || 0;
+    const expiresAtMs = expiresInDays > 0 ? Date.now() + expiresInDays * 24 * 3600 * 1e3 : null;
+    const expires_at = expiresAtMs ? new Date(expiresAtMs).toISOString() : null;
+    if (HAS_SUPABASE) {
+      const code2 = rawCustom || randomCodeString();
+      if (code2.length < 3) return res.status(400).json({ error: "Kode minimal 3 karakter." });
+      const payload = {
+        code: code2,
+        label,
+        max_uses: maxUses,
+        uses: 0,
+        active: true,
+        expires_at,
+        created_at: (/* @__PURE__ */ new Date()).toISOString()
+      };
+      const r = await sbFetch("access_codes", {
+        method: "POST",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify(payload)
+      });
+      if (!r.ok) {
+        const msg = await r.text().catch(() => "");
+        if (r.status === 409 || /duplicate/i.test(msg)) {
+          return res.status(409).json({ error: `Kode "${code2}" sudah ada.` });
+        }
+        return res.status(502).json({ error: `Gagal menyimpan ke Supabase (${r.status})` });
+      }
+      const inserted = await r.json().catch(() => [payload]);
+      codeActiveCache.delete(code2);
+      return res.json({ ok: true, code: Array.isArray(inserted) ? inserted[0] : payload });
+    }
+    const code = rawCustom || generateSignedCode(expiresAtMs);
+    if (code.length < 3) return res.status(400).json({ error: "Kode minimal 3 karakter." });
+    if (localCodeStore.has(code)) return res.status(409).json({ error: `Kode "${code}" sudah ada.` });
+    const record = {
+      code,
+      label,
+      max_uses: maxUses,
+      uses: 0,
+      active: true,
+      expires_at,
+      created_at: (/* @__PURE__ */ new Date()).toISOString(),
+      bound_device: null,
+      kind: rawCustom ? "memory" : "signed"
+    };
+    revokedLocalCodes.delete(code);
+    usedSignedDeviceMap.delete(code);
+    localCodeStore.set(code, record);
+    return res.json({ ok: true, code: record });
+  } catch (e) {
+    return res.status(500).json({ error: e?.message || "Gagal membuat kode" });
+  }
+});
+app.patch("/api/admin/codes/:code", async (req, res) => {
+  if (!requireAdminAuth(req, res)) return;
+  const code = String(req.params.code || "").trim().toUpperCase();
+  if (!code) return res.status(400).json({ error: "Kode tidak valid" });
+  const active = Boolean(req.body?.active);
+  codeActiveCache.delete(code);
+  try {
+    if (HAS_SUPABASE) {
+      const r = await sbFetch(`access_codes?code=eq.${encodeURIComponent(code)}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify({ active })
+      });
+      if (!r.ok) return res.status(502).json({ error: "Gagal mengubah status kode di Supabase" });
+      const rows = await r.json().catch(() => []);
+      return res.json({ ok: true, code: Array.isArray(rows) ? rows[0] : { code, active } });
+    }
+    const mem = localCodeStore.get(code);
+    if (mem) mem.active = active;
+    if (active) revokedLocalCodes.delete(code);
+    else revokedLocalCodes.add(code);
+    return res.json({ ok: true, code: mem || { code, active } });
+  } catch (e) {
+    return res.status(500).json({ error: e?.message || "Gagal update kode" });
+  }
+});
+app.delete("/api/admin/codes/:code", async (req, res) => {
+  if (!requireAdminAuth(req, res)) return;
+  const code = String(req.params.code || "").trim().toUpperCase();
+  if (!code) return res.status(400).json({ error: "Kode tidak valid" });
+  codeActiveCache.delete(code);
+  try {
+    if (HAS_SUPABASE) {
+      const r = await sbFetch(`access_codes?code=eq.${encodeURIComponent(code)}`, { method: "DELETE" });
+      if (!r.ok) return res.status(502).json({ error: "Gagal menghapus kode di Supabase" });
+      return res.json({ ok: true });
+    }
+    revokedLocalCodes.add(code);
+    usedSignedDeviceMap.delete(code);
+    localCodeStore.delete(code);
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ error: e?.message || "Gagal menghapus kode" });
+  }
+});
 var YTM = "https://music.youtube.com/youtubei/v1";
 var CONTEXT = {
   client: {
@@ -30,11 +496,15 @@ var HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 };
 async function yt(endpoint, body = {}, query = "") {
-  const res = await fetch(`${YTM}/${endpoint}?prettyPrint=false${query}`, {
-    method: "POST",
-    headers: HEADERS,
-    body: JSON.stringify({ context: CONTEXT, ...body })
-  });
+  const res = await fetchTimeout(
+    `${YTM}/${endpoint}?prettyPrint=false${query}`,
+    {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({ context: CONTEXT, ...body })
+    },
+    9e3
+  );
   if (!res.ok) throw new Error(`YTM ${endpoint} -> ${res.status}`);
   return res.json();
 }
@@ -208,11 +678,11 @@ function continuationContents(d) {
   return [];
 }
 var cache = /* @__PURE__ */ new Map();
-function cached(key, ttlMs, fn) {
+function cached(key, ttlMs, fn, isValid) {
   const hit = cache.get(key);
   if (hit && Date.now() - hit.t < ttlMs) return Promise.resolve(hit.v);
   return fn().then((v) => {
-    cache.set(key, { v, t: Date.now() });
+    if (!isValid || isValid(v)) cache.set(key, { v, t: Date.now() });
     return v;
   });
 }
@@ -296,7 +766,7 @@ app.get("/api/home", async (_req, res) => {
       }
       const merged = [...idSections, ...homeSections].filter((s) => s && s.items && s.items.length);
       return { sections: merged };
-    });
+    }, (v) => Array.isArray(v?.sections) && v.sections.length > 0);
     res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -345,7 +815,7 @@ app.get("/api/charts", async (_req, res) => {
         sections.push({ title: "Playlist Trending Indonesia", items: idPlaylists });
       }
       return { sections };
-    });
+    }, (v) => Array.isArray(v?.sections) && v.sections.length > 0);
     res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -379,7 +849,7 @@ app.get("/api/moods", async (_req, res) => {
         params: b.clickCommand && b.clickCommand.browseEndpoint && b.clickCommand.browseEndpoint.params
       }));
       return { categories: cats.filter((c) => c.browseId) };
-    });
+    }, (v) => Array.isArray(v?.categories) && v.categories.length > 0);
     res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -456,35 +926,78 @@ app.get("/api/suggest", async (req, res) => {
 });
 app.get("/api/next", async (req, res) => {
   try {
-    const body = { isAudioOnly: true, tunerSettingValue: "AUTOMIX_SETTING_NORMAL" };
-    if (req.query.videoId) {
-      body.videoId = req.query.videoId;
-      body.playlistId = req.query.playlistId || `RDAMVM${req.query.videoId}`;
-      body.watchEndpointMusicSupportedConfigs = {
-        watchEndpointMusicConfig: { musicVideoType: "MUSIC_VIDEO_TYPE_ATV" }
-      };
-    } else if (req.query.playlistId) {
-      body.playlistId = req.query.playlistId;
+    const videoId = String(req.query.videoId || "").trim();
+    const playlistId = String(req.query.playlistId || "").trim();
+    const titleHint = String(req.query.title || "").trim();
+    const artistHint = String(req.query.artist || "").trim();
+    const fetchNextBody = async (plId) => {
+      const body = { isAudioOnly: true, tunerSettingValue: "AUTOMIX_SETTING_NORMAL" };
+      if (videoId) {
+        body.videoId = videoId;
+        body.playlistId = plId || `RDAMVM${videoId}`;
+        body.watchEndpointMusicSupportedConfigs = {
+          watchEndpointMusicConfig: { musicVideoType: "MUSIC_VIDEO_TYPE_ATV" }
+        };
+      } else if (plId) {
+        body.playlistId = plId;
+      }
+      if (req.query.params) body.params = req.query.params;
+      return yt("next", body);
+    };
+    const extractPanels = (d2) => {
+      const panels = findAll(d2, "playlistPanelVideoRenderer");
+      return panels.map((p) => ({
+        videoId: p.videoId,
+        title: displayTitle(text(p.title)),
+        artist: text(p.shortBylineText || p.longBylineText),
+        artists: runsInfo(p.longBylineText),
+        duration: text(p.lengthText),
+        thumbnail: thumbs(p.thumbnail),
+        selected: !!p.selected
+      })).filter((x) => x.videoId);
+    };
+    let d = null;
+    let queue = [];
+    try {
+      d = await fetchNextBody(playlistId);
+      queue = extractPanels(d);
+    } catch {
     }
-    if (req.query.params) body.params = req.query.params;
-    const d = await yt("next", body);
-    const panels = findAll(d, "playlistPanelVideoRenderer");
-    const queue = panels.map((p) => ({
-      videoId: p.videoId,
-      title: displayTitle(text(p.title)),
-      artist: text(p.shortBylineText || p.longBylineText),
-      artists: runsInfo(p.longBylineText),
-      duration: text(p.lengthText),
-      thumbnail: thumbs(p.thumbnail),
-      selected: !!p.selected
-    }));
     let lyricsBrowseId = null;
     let relatedBrowseId = null;
-    for (const tab of findAll(d, "tabRenderer")) {
-      const id = tab.endpoint && tab.endpoint.browseEndpoint && tab.endpoint.browseEndpoint.browseId;
-      if (!id) continue;
-      if (id.startsWith("MPLYt")) lyricsBrowseId = id;
-      if (id.startsWith("MPTRt")) relatedBrowseId = id;
+    if (d) {
+      for (const tab of findAll(d, "tabRenderer")) {
+        const id = tab.endpoint && tab.endpoint.browseEndpoint && tab.endpoint.browseEndpoint.browseId;
+        if (!id) continue;
+        if (id.startsWith("MPLYt")) lyricsBrowseId = id;
+        if (id.startsWith("MPTRt")) relatedBrowseId = id;
+      }
+    }
+    const countOther = (arr) => arr.filter((x) => x.videoId && x.videoId !== videoId).length;
+    if (videoId && playlistId && countOther(queue) === 0) {
+      try {
+        const dRadio = await fetchNextBody(`RDAMVM${videoId}`);
+        const radioQueue = extractPanels(dRadio);
+        if (countOther(radioQueue) > 0) queue = radioQueue;
+      } catch {
+      }
+    }
+    if (videoId && countOther(queue) === 0) {
+      try {
+        const qStr = `${artistHint || titleHint} lagu hits`.trim() || "Lagu Hits Indonesia Terbaru";
+        const dSearch = await yt("search", { query: qStr, params: SEARCH_PARAMS.songs });
+        const found = collectSearchItems(dSearch).filter((it) => it.videoId && it.videoId !== videoId).slice(0, 15).map((it) => ({
+          videoId: it.videoId,
+          title: displayTitle(it.title),
+          artist: it.subtitle || (it.artists || []).map((a) => a.name).join(", "),
+          artists: it.artists || [],
+          duration: it.duration || "",
+          thumbnail: it.thumbnail || null,
+          selected: false
+        }));
+        if (found.length) queue = [...queue, ...found];
+      } catch {
+      }
     }
     res.json({ queue, lyricsBrowseId, relatedBrowseId });
   } catch (e) {
@@ -578,6 +1091,7 @@ var LOADER_API = "https://loader.to/ajax/download.php";
 var DL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 var LOADER_API_KEY = process.env.LOADER_API_KEY || "";
 app.get("/api/download-start", async (req, res) => {
+  if (!await requirePlaybackAccess(req, res)) return;
   const videoId = String(req.query.videoId || "");
   if (!/^[\w-]{6,20}$/.test(videoId)) return res.status(400).json({ error: "bad id" });
   try {
@@ -1092,9 +1606,9 @@ app.get("/api/thumb", async (req, res) => {
     const host = u.hostname;
     const ok = host.endsWith("ytimg.com") || host.endsWith("ggpht.com") || host.endsWith("googleusercontent.com") || host.endsWith("scdn.co") || host.endsWith("spotifycdn.com");
     if (!ok) return res.status(400).end();
-    const r = await fetch(raw, {
+    const r = await fetchTimeout(raw, {
       headers: { "User-Agent": "Mozilla/5.0 SpotifyThumb/1.0", Accept: "image/*" }
-    });
+    }, 6e3);
     if (!r.ok) return res.status(502).end();
     res.setHeader("Content-Type", r.headers.get("content-type") || "image/jpeg");
     res.setHeader("Cache-Control", "public, max-age=86400");
@@ -1393,7 +1907,7 @@ async function resolveSoundCloudStream(videoId, rawTitle, rawArtist, rawDurSec =
         if (!uJson.url) continue;
         if (chosen.format?.protocol === "progressive") {
           const mimeType = (chosen.format?.mime_type || "audio/mpeg").split(";")[0].trim();
-          const expiresAt = Date.now() + 25 * 60 * 1e3;
+          const expiresAt = Date.now() + 5 * 60 * 1e3;
           setScUrlCache(videoId, { url: uJson.url, mimeType, expiresAt });
           return { kind: "url", url: uJson.url, mimeType, expiresAt };
         }
@@ -1439,6 +1953,7 @@ async function resolveSoundCloudStream(videoId, rawTitle, rawArtist, rawDurSec =
 }
 function serveBufferRange(req, res, buf, mimeType) {
   const total = buf.length;
+  const isHead = req.method === "HEAD";
   res.setHeader("Content-Type", mimeType || "audio/mp4");
   res.setHeader("Accept-Ranges", "bytes");
   res.setHeader("Cache-Control", "no-store");
@@ -1462,18 +1977,37 @@ function serveBufferRange(req, res, buf, mimeType) {
     res.status(206);
     res.setHeader("Content-Range", `bytes ${start2}-${end}/${total}`);
     res.setHeader("Content-Length", String(slice.length));
-    return res.send(slice);
+    return isHead ? res.end() : res.send(slice);
   }
   res.status(200);
   res.setHeader("Content-Length", String(total));
-  return res.send(buf);
+  return isHead ? res.end() : res.send(buf);
 }
 async function proxyUpstreamUrl(req, res, targetUrl, fallbackMime, fallbackLength, signal) {
+  const isHead = req.method === "HEAD";
   const reqHeaders = { "User-Agent": DL_UA };
   if (typeof req.headers.range === "string") reqHeaders.Range = req.headers.range;
-  const upstream = await fetch(targetUrl, { headers: reqHeaders, signal });
+  let upstream = await fetch(targetUrl, { method: isHead ? "HEAD" : "GET", headers: reqHeaders, signal });
+  if (isHead && (upstream.status === 405 || upstream.status === 501)) {
+    try {
+      upstream.body?.cancel();
+    } catch {
+    }
+    upstream = await fetch(targetUrl, { method: "GET", headers: reqHeaders, signal });
+  }
   if (!(upstream.ok || upstream.status === 206)) {
+    try {
+      upstream.body?.cancel();
+    } catch {
+    }
     return upstream.status;
+  }
+  if (res.writableEnded || res.headersSent || signal?.aborted) {
+    try {
+      upstream.body?.cancel();
+    } catch {
+    }
+    return 499;
   }
   res.status(upstream.status);
   res.setHeader("Content-Type", upstream.headers.get("content-type") || fallbackMime || "audio/mp4");
@@ -1483,19 +2017,33 @@ async function proxyUpstreamUrl(req, res, targetUrl, fallbackMime, fallbackLengt
   if (cl) res.setHeader("Content-Length", cl);
   const cr = upstream.headers.get("content-range");
   if (cr) res.setHeader("Content-Range", cr);
-  if (!upstream.body) {
+  if (isHead || !upstream.body) {
+    try {
+      upstream.body?.cancel();
+    } catch {
+    }
     res.end();
     return upstream.status;
   }
   const nodeStream = Readable.fromWeb(upstream.body);
-  nodeStream.on("error", () => {
+  const cleanup = () => {
+    try {
+      nodeStream.destroy();
+    } catch {
+    }
+  };
+  res.once("close", cleanup);
+  nodeStream.once("error", () => {
+    res.off("close", cleanup);
     if (!res.headersSent) res.status(502).end();
-    else res.end();
+    else if (!res.writableEnded) res.end();
   });
+  nodeStream.once("end", () => res.off("close", cleanup));
   nodeStream.pipe(res);
   return upstream.status;
 }
 app.get("/api/prefetch", async (req, res) => {
+  if (!await requirePlaybackAccess(req, res)) return;
   const videoId = String(req.query.videoId || "");
   if (!/^[\w-]{6,20}$/.test(videoId)) return res.json({ ok: false });
   const hq = req.query.hq === "1";
@@ -1503,11 +2051,15 @@ app.get("/api/prefetch", async (req, res) => {
   const title = String(req.query.title || "").trim();
   const artist = String(req.query.artist || "").trim();
   const dur = Number(req.query.dur) || 0;
+  const now = Date.now();
   const key = `${videoId}:${hq ? "hq" : "std"}:${prefer}`;
-  if (ytStreamBlockedUntil <= Date.now() && streamCache.has(key) || scUrlCache.has(videoId) || scBufferCache.has(videoId)) {
+  const ytHit = streamCache.get(key);
+  const scUrlHit = scUrlCache.get(videoId);
+  const scBufHit = scBufferCache.get(videoId);
+  if (ytStreamBlockedUntil <= now && ytHit && ytHit.expiresAt > now + 6e4 || scUrlHit && scUrlHit.expiresAt > now || scBufHit && scBufHit.expiresAt > now) {
     return res.json({ ok: true, cached: true });
   }
-  if (ytStreamBlockedUntil <= Date.now()) {
+  if (ytStreamBlockedUntil <= now) {
     try {
       const info = await resolveAudioStream(videoId, hq, prefer, false);
       const probe = await fetchTimeout(info.url, { headers: { Range: "bytes=0-0" } }, 1500);
@@ -1527,6 +2079,7 @@ app.get("/api/prefetch", async (req, res) => {
   return res.json({ ok: !!entry, source: entry ? "sc" : "none" });
 });
 app.get("/api/stream", async (req, res) => {
+  if (!await requirePlaybackAccess(req, res)) return;
   const videoId = String(req.query.videoId || "");
   if (!/^[\w-]{6,20}$/.test(videoId)) return res.status(400).json({ error: "bad videoId" });
   const hq = req.query.hq === "1";
@@ -1581,16 +2134,18 @@ app.get("/api/stream", async (req, res) => {
   }
   try {
     const scStream = await resolveSoundCloudStream(videoId, title, artist, dur);
-    if (scStream && !res.writableEnded) {
+    if (scStream && !res.writableEnded && !ac.signal.aborted) {
       if (scStream.kind === "url") {
         const status = await proxyUpstreamUrl(req, res, scStream.url, scStream.mimeType, void 0, ac.signal);
         if (status >= 200 && status < 300) return;
+        scUrlCache.delete(videoId);
       } else {
         return serveBufferRange(req, res, scStream.buf, scStream.mimeType);
       }
     }
   } catch (e) {
     if (e?.name === "AbortError") return;
+    scUrlCache.delete(videoId);
   }
   if (!res.headersSent) res.status(502).json({ error: "stream unavailable" });
 });

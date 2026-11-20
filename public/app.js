@@ -184,7 +184,7 @@ const Player = {
   sleepTimer: null,
   speed: 1,
   sbSegments: [],
-  sbEnabled: store.get('sb_on', true),
+  sbEnabled: store.get('sb_on', false),
   autoplay: store.get('autoplay', true), // when on, a radio queue is built after the current song
   hq: store.get('yt_hq', false), // false = YouTube Music audio, true = YouTube max quality
   quality: 'hd720',
@@ -227,10 +227,88 @@ function streamQueryFor(videoId, song) {
   return `videoId=${encodeURIComponent(videoId)}&hq=${Player.hq ? 1 : 0}&prefer=${streamPreferParam()}` +
     (title ? `&title=${encodeURIComponent(title)}` : '') +
     (artist ? `&artist=${encodeURIComponent(artist)}` : '') +
-    (dur ? `&dur=${dur}` : '');
+    (dur ? `&dur=${dur}` : '') +
+    (Access.token ? `&token=${encodeURIComponent(Access.token)}&did=${encodeURIComponent(getDeviceId())}` : '');
 }
 function streamUrlFor(videoId, song) {
   return `/api/stream?${streamQueryFor(videoId, song)}`;
+}
+
+/* ================= Playback Access Lock & Admin ================= */
+function getDeviceId() {
+  let id = store.get('device_id', '');
+  if (id && typeof id === 'string' && id.length >= 8) return id;
+  try {
+    if (crypto.randomUUID) {
+      id = 'DEV-' + crypto.randomUUID().replace(/-/g, '').slice(0, 16).toUpperCase();
+    }
+  } catch {}
+  if (!id) {
+    id = 'DEV-' + Math.random().toString(36).slice(2, 10).toUpperCase() + Date.now().toString(36).toUpperCase();
+  }
+  store.set('device_id', id);
+  return id;
+}
+function accessHeaders(extra = {}) {
+  const h = { 'x-device-id': getDeviceId(), ...extra };
+  if (Access.token) h['x-access-token'] = Access.token;
+  return h;
+}
+const Access = {
+  unlocked: false,
+  checked: false,
+  token: store.get('access_token', ''),
+  info: store.get('access_info', null),
+  storage: 'signed',
+  _pendingAction: null,
+  _statusPromise: null,
+};
+
+async function syncAccessStatus(force = false) {
+  if (Access._statusPromise && !force) return Access._statusPromise;
+  Access._statusPromise = (async () => {
+    try {
+      const r = await fetch('/api/access/status', { headers: accessHeaders() });
+      if (r.ok) {
+        const d = await r.json();
+        Access.unlocked = !!d.unlocked;
+        Access.storage = d.storage || 'signed';
+        Access.checked = true;
+        if (d.unlocked) {
+          Access.info = { label: d.label || 'Akses Aktif', code: d.code || '', expiresAt: d.expiresAt || null };
+          store.set('access_info', Access.info);
+        } else {
+          Access.token = '';
+          Access.info = null;
+          store.set('access_token', '');
+          store.set('access_info', null);
+        }
+      }
+    } catch {
+      Access.checked = true;
+    } finally {
+      Access._statusPromise = null;
+    }
+    return Access.unlocked;
+  })();
+  return Access._statusPromise;
+}
+
+async function requireUnlocked(actionFn, noticeMsg = '') {
+  if (Access.unlocked) {
+    if (typeof actionFn === 'function') actionFn();
+    return true;
+  }
+  if (!Access.checked && Access.token) {
+    const ok = await syncAccessStatus();
+    if (ok) {
+      if (typeof actionFn === 'function') actionFn();
+      return true;
+    }
+  }
+  Access._pendingAction = typeof actionFn === 'function' ? actionFn : null;
+  openAccessLockModal(noticeMsg);
+  return false;
 }
 function isPlayingNow() {
   if (isUsingAudio()) {
@@ -271,7 +349,12 @@ function stopBgAudio() {
   try { bgAudio.removeAttribute('src'); bgAudio.load(); } catch {}
 }
 function stopYtPlayer() {
-  if (Player.yt && Player.ready) { try { Player.yt.pauseVideo(); } catch {} }
+  if (Player.yt && Player.ready) {
+    try {
+      if (Player.yt.stopVideo) Player.yt.stopVideo();
+      else Player.yt.pauseVideo();
+    } catch {}
+  }
 }
 function syncMediaSessionMetadata(s) {
   if (!('mediaSession' in navigator) || !s) return;
@@ -321,7 +404,7 @@ function syncMediaSessionPosition() {
 
 const _prefetchedVids = new Set();
 function prefetchSong(song) {
-  if (!Player.bgMode || !song || !song.videoId) return;
+  if (!Access.unlocked || !Player.bgMode || !song || !song.videoId) return;
   const vid = song.videoId;
   if (_prefetchedVids.has(vid)) return;
   if (_prefetchedVids.size >= 40) {
@@ -329,10 +412,10 @@ function prefetchSong(song) {
     if (oldest) _prefetchedVids.delete(oldest);
   }
   _prefetchedVids.add(vid);
-  fetch(`/api/prefetch?${streamQueryFor(vid, song)}`).catch(() => {});
+  fetch(`/api/prefetch?${streamQueryFor(vid, song)}`, { headers: accessHeaders() }).catch(() => {});
 }
 function prefetchNextAudio() {
-  if (!Player.bgMode) return;
+  if (!Access.unlocked || !Player.bgMode) return;
   prefetchSong(Player.queue[Player.index + 1]);
   prefetchSong(Player.queue[Player.index + 2]);
 }
@@ -349,6 +432,7 @@ document.addEventListener('pointerdown', unlockMobileAudio, { passive: true, onc
 document.addEventListener('keydown', unlockMobileAudio, { passive: true, once: true });
 
 function playYtAt(videoId, startSec = 0, playNow = true) {
+  if (!Access.unlocked) return;
   const myLoad = Player.loadId;
   const run = () => {
     if (myLoad !== Player.loadId) return;
@@ -368,11 +452,12 @@ function playYtAt(videoId, startSec = 0, playNow = true) {
   run();
 }
 function fallbackToYT(startSec = 0, playNow = true) {
+  if (!Access.unlocked) return;
   const s = Player.current;
   if (!s) return;
-  // When screen is off / app is in background on mobile, skip to next queued track (up to 2 tries)
+  // When screen is off / app is in background on mobile, skip to next queued/suggested track (up to 2 tries)
   // before falling back to YouTube IFrame so temporary stream failures don't kill background mode.
-  if (document.hidden && Player.bgMode && Player._bgSkipStreak < 2 && Player.queue.length > Player.index + 1) {
+  if (document.hidden && Player.bgMode && Player._bgSkipStreak < 2 && (Player.queue.length > Player.index + 1 || Player.autoplay)) {
     Player._bgSkipStreak++;
     nextTrack(true);
     return;
@@ -385,6 +470,10 @@ function fallbackToYT(startSec = 0, playNow = true) {
   playYtAt(s.videoId, startSec, playNow);
 }
 function startAudioTrack(s, startSec = 0, playNow = true) {
+  if (!Access.unlocked) {
+    requireUnlocked(() => startAudioTrack(s, startSec, playNow));
+    return;
+  }
   if (!bgAudio || !s || !s.videoId) {
     fallbackToYT(startSec, playNow);
     return;
@@ -413,7 +502,15 @@ function startAudioTrack(s, startSec = 0, playNow = true) {
     if (p && p.catch) {
       p.catch((err) => {
         if (aid !== Player._audioLoadId || Player.engine !== 'audio') return;
-        if (err && err.name === 'NotSupportedError') fallbackToYT(startSec, Player.wantPlay);
+        if (err && err.name === 'AbortError') return;
+        if (err && err.name === 'NotSupportedError') {
+          fallbackToYT(startSec, Player.wantPlay);
+          return;
+        }
+        document.body.classList.add('paused');
+        renderPlayButtons();
+        syncPipVideo();
+        syncMediaSessionPosition();
       });
     }
   }
@@ -486,6 +583,8 @@ if (bgAudio) {
   });
   bgAudio.addEventListener('ended', () => {
     if (Player.engine !== 'audio' || !Player.current) return;
+    if (Player._endedAudioLoadId === Player._audioLoadId) return;
+    Player._endedAudioLoadId = Player._audioLoadId;
     nextTrack(true);
   });
   bgAudio.addEventListener('error', () => {
@@ -493,6 +592,14 @@ if (bgAudio) {
     const s = Player.current;
     const aid = Player._audioLoadId;
     const resumeAt = getCurTime();
+    const dur = getDurationSec();
+    if (Player.wantPlay && dur > 10 && resumeAt >= dur - 2.5) {
+      if (Player._endedAudioLoadId !== aid) {
+        Player._endedAudioLoadId = aid;
+        nextTrack(true);
+      }
+      return;
+    }
     if (Player.wantPlay && resumeAt > 2 && Player._audioRetries < 2) {
       Player._audioRetries++;
       const retryNo = Player._audioRetries;
@@ -508,7 +615,15 @@ if (bgAudio) {
       }, 450 * retryNo);
       return;
     }
-    fallbackToYT(resumeAt, Player.wantPlay);
+    syncAccessStatus(true).then((ok) => {
+      if (!ok) {
+        userPause();
+        stopBgAudio();
+        openAccessLockModal('Akses Anda terkunci atau dinonaktifkan Admin. Masukkan kode akses aktif untuk memutar musik.');
+        return;
+      }
+      fallbackToYT(resumeAt, Player.wantPlay);
+    });
   });
 }
 
@@ -649,10 +764,20 @@ window.onYouTubeIframeAPIReady = () => {
     },
   });
 };
-(() => { const s = document.createElement('script'); s.src = 'https://www.youtube.com/iframe_api'; document.head.appendChild(s); })();
+(() => {
+  if (!window.YT && !document.querySelector('script[src*="youtube.com/iframe_api"]')) {
+    const s = document.createElement('script');
+    s.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(s);
+  }
+})();
 
 function playSong(song, queue = null, index = null, context = '') {
   if (!song || !song.videoId) return;
+  if (!Access.unlocked) {
+    requireUnlocked(() => playSong(song, queue, index, context));
+    return;
+  }
   song = normalizeSong(song);
   Player.cued = false;
   Player.pending = null;
@@ -665,7 +790,6 @@ function playSong(song, queue = null, index = null, context = '') {
     Player.index = idx;
   } else { Player.queue = [{ ...song, _user: false }]; Player.index = 0; }
   startCurrent();
-  if (!queue || queue.length <= 1) fetchQueue(song); // build radio queue
 }
 
 function userQueueCount() {
@@ -792,8 +916,13 @@ function moveQueued(i, dir) {
 }
 
 function startCurrent() {
+  if (!Access.unlocked) {
+    requireUnlocked(() => startCurrent());
+    return;
+  }
   Player.cued = false;
   Player.pending = null;
+  Player._endedAudioLoadId = -1;
   const s = Player.current;
   if (!s) return;
   ++Player.loadId;
@@ -815,6 +944,7 @@ function startCurrent() {
   syncFloatLyric('');
   autoOpenNowPlayingDesktop(); // desktop: reveal the side panel when playback starts
   renderNowPlaying();
+  renderPlayButtons();
   renderQueue();
   updateLikeButtons();
   $('#miniplayer').classList.remove('hidden');
@@ -830,6 +960,10 @@ function startCurrent() {
   Player.lyricsBrowseId = null;
   $('#related-list').innerHTML = '<div class="loading-note">Loading…</div>';
   Player._relatedLoaded = false;
+  // Proactively fill suggested radio tracks whenever we're at the last track in queue
+  if (Player.autoplay && Player.index >= Player.queue.length - 1) {
+    fetchQueue(s, { radioOnly: Player.queue.length > 1 });
+  }
   // if the Related tab is currently open, reload it right away for the new song
   // (small delay so fetchQueue for the new song has started first)
   if ($('#np-related').classList.contains('active') && !$('#nowplaying').classList.contains('hidden')) {
@@ -837,34 +971,104 @@ function startCurrent() {
   }
 }
 
-async function fetchQueue(song) {
+async function fetchSuggestedFallback(song, excludeIds) {
+  try {
+    const qStr = `${song.artist || song.title || 'Lagu Hits Indonesia'}`.trim();
+    const sRes = await api(`/api/search?q=${encodeURIComponent(qStr)}&filter=songs`);
+    const found = (sRes.sections || [])
+      .flatMap((sec) => sec.items || [])
+      .filter((it) => it && it.videoId && !excludeIds.has(it.videoId));
+    if (found.length) return found;
+  } catch {}
+  try {
+    const cRes = await api('/api/charts');
+    return (cRes.sections || [])
+      .flatMap((sec) => sec.items || [])
+      .filter((it) => it && it.videoId && !excludeIds.has(it.videoId));
+  } catch {}
+  return [];
+}
+
+async function fetchQueue(song, opts = {}) {
   const vid = song && song.videoId;
+  if (!vid) return false;
   const loadId = Player.loadId;
   Player._queueFetching = true;
   try {
-    const d = await api(`/api/next?videoId=${encodeURIComponent(song.videoId)}${song.playlistId ? `&playlistId=${encodeURIComponent(song.playlistId)}` : ''}`);
-    if (Player.cued || loadId !== Player.loadId) return;
-    if (!vid || !Player.current || Player.current.videoId !== vid) return;
-    Player.lyricsBrowseId = d.lyricsBrowseId;
-    Player.relatedBrowseId = d.relatedBrowseId;
-    // Autoplay off: skip building the radio queue (lyrics/related still load above).
-    if (Player.autoplay && d.queue && d.queue.length > 1) {
-      const current = Player.current;
-      const userUpcoming = Player.queue.filter((q, i) => i > Player.index && q._user);
-      const radio = d.queue
-        .filter((q) => q.videoId && q.videoId !== (current && current.videoId))
-        .filter((q) => !userUpcoming.some((u) => u.videoId === q.videoId))
-        .map((q) => ({ ...normalizeSong(q), artist: q.artist, _user: false }));
-      Player.queue = [current, ...userUpcoming, ...radio].filter(Boolean);
-      Player.index = 0;
-      renderQueue();
-      prefetchNextAudio();
+    const qs = new URLSearchParams({ videoId: vid });
+    if (!opts.radioOnly && song.playlistId) qs.set('playlistId', song.playlistId);
+    if (song.title) qs.set('title', song.title);
+    if (song.artist || song.subtitle) qs.set('artist', song.artist || song.subtitle);
+
+    let d = null;
+    try {
+      d = await api(`/api/next?${qs.toString()}`);
+    } catch {
+      d = { queue: [] };
     }
+    if (Player.cued || loadId !== Player.loadId) return false;
+    if (!Player.current || Player.current.videoId !== vid) return false;
+
+    if (d.lyricsBrowseId) Player.lyricsBrowseId = d.lyricsBrowseId;
+    if (d.relatedBrowseId) Player.relatedBrowseId = d.relatedBrowseId;
     if (!Player.lyrics.synced && !Player.lyrics.plain) loadLyrics(Player.current, { silent: true });
-  } catch (e) { console.warn('queue fail', e); }
-  finally {
+
+    if (Player.autoplay || opts.force) {
+      const current = Player.current;
+      const before = Player.queue.slice(Math.max(0, Player.index - 24), Player.index + 1);
+      const userUpcoming = Player.queue.filter((q, i) => i > Player.index && q._user);
+      const excludeIds = new Set([
+        ...before.map((x) => x && x.videoId).filter(Boolean),
+        ...userUpcoming.map((x) => x && x.videoId).filter(Boolean),
+      ]);
+
+      let candidates = Array.isArray(d.queue) ? d.queue.filter((q) => q && q.videoId && !excludeIds.has(q.videoId)) : [];
+      if (!candidates.length) {
+        candidates = await fetchSuggestedFallback(current, excludeIds);
+        if (Player.cued || loadId !== Player.loadId || !Player.current || Player.current.videoId !== vid) return false;
+      }
+
+      if (candidates.length) {
+        const seen = new Set(excludeIds);
+        const radio = [];
+        for (const q of candidates) {
+          if (!q.videoId || seen.has(q.videoId)) continue;
+          seen.add(q.videoId);
+          radio.push({ ...songFromItem(q), _user: false });
+        }
+        if (radio.length) {
+          Player.queue = [...before, ...userUpcoming, ...radio].filter(Boolean);
+          Player.index = before.length - 1;
+          renderQueue();
+          prefetchNextAudio();
+          return true;
+        }
+      }
+    }
+    return false;
+  } catch (e) {
+    console.warn('queue fail', e);
+    return false;
+  } finally {
     if (loadId === Player.loadId) Player._queueFetching = false;
   }
+}
+
+async function advanceWithSuggested(song) {
+  const loadId = Player.loadId;
+  const ok = await fetchQueue(song, { radioOnly: true, force: true });
+  if (loadId !== Player.loadId || !Player.current || Player.current.videoId !== song.videoId) return;
+  if (ok && Player.index + 1 < Player.queue.length) {
+    Player.index++;
+    startCurrent();
+    return;
+  }
+  if (Player.queue.length > 1) {
+    Player.index = 0;
+    startCurrent();
+    return;
+  }
+  userPause();
 }
 
 function nextTrack(auto) {
@@ -873,7 +1077,12 @@ function nextTrack(auto) {
     togglePlay();
     return;
   }
-  if (Player.repeat === 2 && auto) { seekToSec(0); userPlay(); return; }
+  if (Player.repeat === 2 && auto) {
+    Player._endedAudioLoadId = -1;
+    seekToSec(0);
+    userPlay();
+    return;
+  }
   if (!Player.queue.length) {
     if (Player.current) startCurrent();
     return;
@@ -883,17 +1092,30 @@ function nextTrack(auto) {
     const userNext = Player.queue.findIndex((q, i) => i > Player.index && q._user);
     if (userNext >= 0) ni = userNext;
     else {
-      const others = Player.queue.map((_, i) => i).filter((i) => i !== Player.index);
-      if (!others.length) ni = 0;
-      else ni = others[Math.floor(Math.random() * others.length)];
+      const upcoming = Player.queue.map((_, i) => i).filter((i) => i > Player.index);
+      if (upcoming.length) {
+        ni = upcoming[Math.floor(Math.random() * upcoming.length)];
+      } else if (Player.repeat === 1) {
+        const pool = Player.queue.map((_, i) => i).filter((i) => i !== Player.index);
+        ni = pool.length ? pool[Math.floor(Math.random() * pool.length)] : 0;
+      } else {
+        ni = Player.queue.length;
+      }
     }
   } else ni = Player.index + 1;
 
   if (ni >= Player.queue.length) {
-    if (Player.repeat === 1) ni = 0;
-    else {
-      if (Player.current) fetchQueue(Player.current);
+    if (Player.repeat === 1) {
       ni = 0;
+    } else if (Player.autoplay || !auto) {
+      if (Player.current) {
+        advanceWithSuggested(Player.current);
+        return;
+      }
+      ni = 0;
+    } else {
+      userPause();
+      return;
     }
   }
   Player.index = Math.max(0, Math.min(ni, Player.queue.length - 1));
@@ -908,6 +1130,10 @@ function prevTrack() {
 /* Explicit intent. userPlay/userPause record what the user wants so background
    resume never fights a deliberate pause. */
 function userPlay() {
+  if (!Access.unlocked) {
+    requireUnlocked(() => userPlay());
+    return;
+  }
   Player.wantPlay = true;
   Player.pipResumeTries = 0;
   if (isUsingAudio()) {
@@ -916,7 +1142,15 @@ function userPlay() {
       return;
     }
     bgAudio.play().catch((err) => {
-      if (err && err.name === 'NotSupportedError' && Player.current) fallbackToYT(getCurTime(), true);
+      if (err && err.name === 'AbortError') return;
+      if (err && err.name === 'NotSupportedError' && Player.current) {
+        fallbackToYT(getCurTime(), true);
+        return;
+      }
+      document.body.classList.add('paused');
+      renderPlayButtons();
+      syncPipVideo();
+      syncMediaSessionPosition();
     });
     return;
   }
@@ -933,11 +1167,12 @@ function userPause() {
 }
 function togglePlay() {
   if (!Player.current) return;
+  if (!Access.unlocked) {
+    requireUnlocked(() => togglePlay());
+    return;
+  }
   if (Player.cued) {
-    const s = Player.current;
-    const hasRadio = Player.queue.some((q, i) => i > Player.index && !q._user);
     startCurrent();
-    if (!hasRadio) fetchQueue(s);
     return;
   }
   if (!isPlayerReadyNow()) return;
@@ -946,6 +1181,10 @@ function togglePlay() {
 }
 function playPendingSong() {
   const s = Player.pending;
+  if (!Access.unlocked) {
+    requireUnlocked(() => playPendingSong());
+    return;
+  }
   if (!s || !s.videoId) return togglePlay();
   Player.pending = null;
   Player.context = ''; // picked a standalone song — no collection context
@@ -953,7 +1192,6 @@ function playPendingSong() {
   Player.queue = [{ ...normalizeSong(s), _user: false }, ...userUpcoming];
   Player.index = 0;
   startCurrent();
-  fetchQueue(s);
 }
 function toggleNowPlayingPlay() {
   if (isPreviewing()) {
@@ -967,6 +1205,11 @@ function toggleNowPlayingPlay() {
 let _lastTick = null;
 setInterval(() => {
   if (!Player.current || !isPlayerReadyNow()) return;
+  if (isUsingAudio() && Player.wantPlay && bgAudio.ended && Player._endedAudioLoadId !== Player._audioLoadId) {
+    Player._endedAudioLoadId = Player._audioLoadId;
+    nextTrack(true);
+    return;
+  }
   const cur = getCurTime();
   // local scrobble: accumulate listen time while playing
   const playing = isPlayingNow();
@@ -1010,7 +1253,7 @@ let sbReqId = 0; // guards against a stale response overwriting a newer song's s
 async function loadSponsorBlock(videoId) {
   const myReq = ++sbReqId;
   Player.sbSegments = [];
-  if (!videoId) return;
+  if (!videoId || !Player.sbEnabled) return;
   try {
     const d = await api(`/api/sponsorblock?videoId=${encodeURIComponent(videoId)}`);
     // a newer song started while we were fetching — drop this response
@@ -1035,6 +1278,9 @@ function toggleSB() {
   $('#np-sb').classList.toggle('on', Player.sbEnabled);
   syncNpMore();
   toast(Player.sbEnabled ? 'SponsorBlock on' : 'SponsorBlock off');
+  if (Player.sbEnabled && Player.current && !Player.sbSegments.length) {
+    loadSponsorBlock(Player.current.videoId);
+  }
 }
 function toggleAutoplay() {
   Player.autoplay = !Player.autoplay;
@@ -1443,13 +1689,17 @@ function clickDownload(href, name) {
 }
 async function downloadSong(song) {
   if (!song || !song.videoId) return;
+  if (!Access.unlocked) {
+    requireUnlocked(() => downloadSong(song));
+    return;
+  }
   if (activeDownloads.has(song.videoId)) { toast('Already downloading this song…'); return; }
   activeDownloads.add(song.videoId);
   toast(`Preparing "${song.title}" (320kbps MP3)…`);
   try {
     let st;
     try {
-      const r = await fetch(`/api/download-start?videoId=${encodeURIComponent(song.videoId)}`);
+      const r = await fetch(`/api/download-start?videoId=${encodeURIComponent(song.videoId)}`, { headers: accessHeaders() });
       const body = await r.json().catch(() => ({}));
       if (!r.ok) {
         // backend forwards the converter's own reason in `error`
@@ -1762,6 +2012,10 @@ function resetNpSeek(s) {
 }
 function openSongNowPlaying(song) {
   if (!song || !song.videoId) return;
+  if (!Access.unlocked) {
+    requireUnlocked(() => openSongNowPlaying(song));
+    return;
+  }
   const same = Player.current && Player.current.videoId === song.videoId;
   // Picking a song plays it immediately (no preview-then-press-Play step).
   if (same) {
@@ -1873,6 +2127,11 @@ async function route() {
   const hash = location.hash || '#/home';
   if (hash === '#settings') {
     openSettingsModal();
+    return;
+  }
+  if (hash === '#/admin') {
+    if (!$('#view').innerHTML) await viewHome($('#view')).catch(() => {});
+    openAdminModal();
     return;
   }
   const [path, qs] = hash.slice(2).split('?');
@@ -2060,30 +2319,44 @@ async function viewHome(view) {
     if (tagEl) tagEl.textContent = sl.tagline;
   };
 
-  let heroTimer = setInterval(() => {
+  clearInterval(window._heroTimer);
+  window._heroTimer = setInterval(() => {
     setHeroSlide(activeSlide + 1);
   }, 4500);
 
   const bannerWrap = $('.hero-banner-wrap', view);
   if (bannerWrap) {
-    bannerWrap.addEventListener('mouseenter', () => clearInterval(heroTimer));
+    bannerWrap.addEventListener('mouseenter', () => clearInterval(window._heroTimer));
     bannerWrap.addEventListener('mouseleave', () => {
-      clearInterval(heroTimer);
-      heroTimer = setInterval(() => setHeroSlide(activeSlide + 1), 4500);
+      clearInterval(window._heroTimer);
+      window._heroTimer = setInterval(() => setHeroSlide(activeSlide + 1), 4500);
     });
     let touchStartX = 0;
+    let touchStartY = 0;
+    let didSwipe = false;
     bannerWrap.addEventListener('pointerdown', (e) => {
       touchStartX = e.clientX;
-    });
+      touchStartY = e.clientY;
+      didSwipe = false;
+    }, { passive: true });
     bannerWrap.addEventListener('pointerup', (e) => {
-      const diff = e.clientX - touchStartX;
-      if (Math.abs(diff) > 35) {
-        if (diff > 0) setHeroSlide(activeSlide - 1);
+      const dx = e.clientX - touchStartX;
+      const dy = e.clientY - touchStartY;
+      if (Math.abs(dx) > 35 && Math.abs(dx) > Math.abs(dy)) {
+        didSwipe = true;
+        if (dx > 0) setHeroSlide(activeSlide - 1);
         else setHeroSlide(activeSlide + 1);
       }
-    });
+    }, { passive: true });
+    bannerWrap.addEventListener('click', (e) => {
+      if (didSwipe) {
+        didSwipe = false;
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    }, true);
   }
-  window.addEventListener('hashchange', () => clearInterval(heroTimer), { once: true });
+  window.addEventListener('hashchange', () => clearInterval(window._heroTimer), { once: true });
 
   const playHeroBtn = $('#hero-play-btn', view);
   const browseHeroBtn = $('#hero-browse-btn', view);
@@ -2581,7 +2854,7 @@ function backupLibrary() {
     stats: Library.stats,
     settings: {
       vol: store.get('vol', 100),
-      sb_on: store.get('sb_on', true),
+      sb_on: store.get('sb_on', false),
       yt_hq: store.get('yt_hq', false),
       bg_audio: store.get('bg_audio', true),
     },
@@ -2877,6 +3150,8 @@ function syncNpMore() {
 function closeModal() {
   const modal = $('#modal');
   if (modal) modal.classList.add('hidden');
+  const card = $('.modal-card');
+  if (card) card.classList.remove('wide');
   const actions = $('.modal-actions');
   if (actions) actions.classList.remove('hidden');
 }
@@ -3206,6 +3481,7 @@ $('#mini-shuffle').addEventListener('click', (e) => {
   Player.shuffle = !Player.shuffle;
   $('#mini-shuffle').classList.toggle('on', Player.shuffle);
   $('#np-shuffle').classList.toggle('on', Player.shuffle);
+  persistQueue();
   toast(Player.shuffle ? 'Shuffle on' : 'Shuffle off');
 });
 $('#mini-repeat').addEventListener('click', (e) => {
@@ -3939,6 +4215,13 @@ function tryPipResume() {
   if (!Player.wantPlay || !Player.current || Player.cued) return;
   if (!Player.floatOn && !isUsingAudio()) return;
   if (!isPlayerReadyNow()) return;
+  if (isUsingAudio() && bgAudio.ended) {
+    if (Player._endedAudioLoadId !== Player._audioLoadId) {
+      Player._endedAudioLoadId = Player._audioLoadId;
+      nextTrack(true);
+    }
+    return;
+  }
   if (isPlayingNow()) { Player.pipResumeTries = 0; return; }
   if (Player.pipResumeTries >= PIP_RESUME_MAX) return;
   Player.pipResumeTries++;
@@ -3975,15 +4258,364 @@ if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => setTimeout(hide, 1500));
   setTimeout(hide, 2800);
 })();
-function openSettingsModal() {
+function getAdminToken() {
+  try { return sessionStorage.getItem('smw_admin_tok') || ''; } catch { return ''; }
+}
+function setAdminToken(tok) {
+  try {
+    if (tok) sessionStorage.setItem('smw_admin_tok', tok);
+    else sessionStorage.removeItem('smw_admin_tok');
+  } catch {}
+}
+
+function openAccessLockModal(noticeMsg = '') {
   const modal = $('#modal');
+  const card = $('.modal-card');
   const body = $('#modal-body');
   const actions = $('.modal-actions');
+  if (card) card.classList.remove('wide');
+  $('#modal-title').textContent = 'Pemutaran Musik Terkunci';
+  if (actions) actions.classList.add('hidden');
+  body.innerHTML = `<form class="pl-form" id="lock-form" autocomplete="off">
+      <div class="pl-form-cover" aria-hidden="true">${icon('i-lock')}</div>
+      <div class="lock-err${noticeMsg ? '' : ' hidden'}" id="lock-err">${esc(noticeMsg)}</div>
+      <label class="pl-form-label" for="lock-code-input">Kode Akses</label>
+      <input id="lock-code-input" class="pl-form-input" type="text" placeholder="Contoh: SP1-0-XXXX-XXXXXXXX" style="text-transform:uppercase;letter-spacing:0.05em" />
+      <div class="pl-form-hint">Aplikasi ini dikunci oleh Admin (maksimal 1 perangkat per kode). Masukkan kode akses yang Anda terima untuk memutar lagu.</div>
+      <div class="pl-form-actions">
+        <button type="button" class="pill-btn" id="lock-cancel">Nanti</button>
+        <button type="submit" class="pill-btn primary" id="lock-submit">${icon('i-key')}<span>Buka Akses</span></button>
+      </div>
+      <div class="lock-foot">
+        <span>Khusus pemilik web:</span>
+        <button type="button" class="lock-admin-link" id="lock-open-admin">Panel Admin &rarr;</button>
+      </div>
+    </form>`;
+  const inp = $('#lock-code-input');
+  const errBox = $('#lock-err');
+  const submitBtn = $('#lock-submit');
+  const showErr = (msg) => {
+    if (!errBox) return;
+    errBox.textContent = msg;
+    errBox.classList.remove('hidden');
+    if (inp) { inp.classList.add('shake'); setTimeout(() => inp.classList.remove('shake'), 400); inp.focus(); }
+  };
+  $('#lock-cancel').addEventListener('click', () => {
+    Access._pendingAction = null;
+    closeModal();
+  });
+  $('#lock-open-admin').addEventListener('click', () => {
+    openAdminModal();
+  });
+  $('#lock-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const code = (inp && inp.value || '').trim().toUpperCase();
+    if (!code) { showErr('Masukkan kode akses dari Admin terlebih dahulu.'); return; }
+    if (errBox) errBox.classList.add('hidden');
+    if (submitBtn) { submitBtn.disabled = true; submitBtn.innerHTML = icon('i-key') + '<span>Memeriksa…</span>'; }
+    try {
+      const r = await fetch('/api/access/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-device-id': getDeviceId() },
+        body: JSON.stringify({ code, deviceId: getDeviceId() }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.unlocked) {
+        showErr(d.error || 'Kode akses tidak valid.');
+        if (submitBtn) { submitBtn.disabled = false; submitBtn.innerHTML = icon('i-key') + '<span>Buka Akses</span>'; }
+        return;
+      }
+      Access.unlocked = true;
+      Access.checked = true;
+      Access.token = d.token || '';
+      Access.info = { label: d.label || 'Akses Aktif', code: d.code || code, expiresAt: d.expiresAt || null };
+      Access.storage = d.storage || Access.storage;
+      store.set('access_token', Access.token);
+      store.set('access_info', Access.info);
+      const pending = Access._pendingAction;
+      Access._pendingAction = null;
+      closeModal();
+      toast(`Akses dibuka (${Access.info.label})`);
+      if (typeof pending === 'function') pending();
+    } catch {
+      showErr('Gagal terhubung ke server. Coba lagi.');
+      if (submitBtn) { submitBtn.disabled = false; submitBtn.innerHTML = icon('i-key') + '<span>Buka Akses</span>'; }
+    }
+  });
+  modal.classList.remove('hidden');
+  setTimeout(() => inp && inp.focus(), 60);
+}
+
+async function openAdminModal() {
+  const modal = $('#modal');
+  const card = $('.modal-card');
+  const body = $('#modal-body');
+  const actions = $('.modal-actions');
+  if (card) card.classList.add('wide');
+  if (actions) actions.classList.add('hidden');
+
+  const tok = getAdminToken();
+  if (!tok) {
+    $('#modal-title').textContent = 'Login Admin';
+    body.innerHTML = `<form class="pl-form" id="admin-login-form" autocomplete="off">
+        <div class="pl-form-cover" aria-hidden="true">${icon('i-key')}</div>
+        <div class="lock-err hidden" id="adm-err"></div>
+        <label class="pl-form-label" for="adm-pw">Password Admin</label>
+        <input id="adm-pw" class="pl-form-input" type="password" placeholder="Masukkan password admin..." />
+        <div class="pl-form-hint">Masukkan password admin yang diatur pada Environment Variable <b>ADMIN_PASSWORD</b>.</div>
+        <div class="pl-form-actions">
+          <button type="button" class="pill-btn" id="adm-cancel">Tutup</button>
+          <button type="submit" class="pill-btn primary" id="adm-go">${icon('i-key')}<span>Masuk</span></button>
+        </div>
+      </form>`;
+    const pwInp = $('#adm-pw');
+    const errEl = $('#adm-err');
+    const goBtn = $('#adm-go');
+    $('#adm-cancel').addEventListener('click', closeModal);
+    $('#admin-login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const pw = (pwInp && pwInp.value || '').trim();
+      if (!pw) return;
+      if (errEl) errEl.classList.add('hidden');
+      if (goBtn) goBtn.disabled = true;
+      try {
+        const r = await fetch('/api/admin/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: pw }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok || !d.adminToken) {
+          if (errEl) { errEl.textContent = d.error || 'Password salah.'; errEl.classList.remove('hidden'); }
+          if (goBtn) goBtn.disabled = false;
+          return;
+        }
+        setAdminToken(d.adminToken);
+        openAdminModal();
+      } catch {
+        if (errEl) { errEl.textContent = 'Gagal terhubung ke server.'; errEl.classList.remove('hidden'); }
+        if (goBtn) goBtn.disabled = false;
+      }
+    });
+    modal.classList.remove('hidden');
+    setTimeout(() => pwInp && pwInp.focus(), 60);
+    return;
+  }
+
+  $('#modal-title').textContent = 'Panel Admin · Kelola Kode Akses';
+  body.innerHTML = `<div class="loading-note">Memuat panel admin…</div>`;
+  modal.classList.remove('hidden');
+
+  const fetchCodes = async () => {
+    const r = await fetch('/api/admin/codes', { headers: { Authorization: `Bearer ${getAdminToken()}` } });
+    if (r.status === 401) {
+      setAdminToken('');
+      openAdminModal();
+      return null;
+    }
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || 'Gagal memuat kode');
+    return d;
+  };
+
+  let data;
+  try {
+    data = await fetchCodes();
+    if (!data) return;
+  } catch (e) {
+    body.innerHTML = `<div class="lock-err">${esc(e.message || 'Gagal memuat panel admin')}</div>
+      <div class="pl-form-actions"><button type="button" class="pill-btn" id="adm-err-close">Tutup</button></div>`;
+    $('#adm-err-close').addEventListener('click', closeModal);
+    return;
+  }
+
+  const isDb = data.storage === 'supabase';
+  const renderDashboard = (codes) => {
+    const rowsHtml = codes.length
+      ? codes.map((c) => {
+          const usesTxt = c.max_uses === 1
+            ? `Maks 1 perangkat (${c.uses || 0}/1)`
+            : (c.max_uses > 0 ? `${c.uses || 0}/${c.max_uses} pakai` : `${c.uses || 0} pakai (tanpa batas)`);
+          const expTxt = c.expires_at ? `Exp: ${new Date(c.expires_at).toLocaleDateString('id-ID')}` : 'Selamanya';
+          return `<div class="admin-code-row${c.active ? '' : ' revoked'}" data-code="${esc(c.code)}">
+            <div class="admin-code-main">
+              <div class="admin-code-val">${esc(c.code)}</div>
+              <div class="admin-code-meta">${esc(c.label || 'Pengguna')} · ${esc(usesTxt)} · ${esc(expTxt)} · <b>${c.active ? 'Aktif' : 'Nonaktif'}</b></div>
+            </div>
+            <div class="admin-code-actions">
+              <button type="button" class="admin-mini-btn copy" data-act="copy" data-code="${esc(c.code)}">Salin</button>
+              <button type="button" class="admin-mini-btn" data-act="toggle" data-code="${esc(c.code)}" data-active="${c.active ? '1' : '0'}">${c.active ? 'Matikan' : 'Aktifkan'}</button>
+              <button type="button" class="admin-mini-btn danger" data-act="del" data-code="${esc(c.code)}">Hapus</button>
+            </div>
+          </div>`;
+        }).join('')
+      : `<div class="sq-empty" style="padding:12px 4px">${isDb
+          ? 'Belum ada kode akses di Supabase. Buat kode pertama Anda di atas.'
+          : 'Buat kode akses baru di atas lalu klik Salin untuk dikirim ke pengguna.'}</div>`;
+
+    body.innerHTML = `
+      <div class="admin-top-bar">
+        <span class="admin-status-badge${isDb ? ' db' : ''}">${isDb ? '● Supabase Terhubung' : '● Mode Tanpa Database (Signed Code)'}</span>
+        <button type="button" class="admin-mini-btn" id="adm-logout">Keluar Admin</button>
+      </div>
+      ${data.usingDefaultPassword ? `<div class="admin-warn-box">⚠️ Masih memakai password admin default (<code>admin1234</code>). Segera set Environment Variable <b>ADMIN_PASSWORD</b> di Vercel / Secrets.</div>` : ''}
+      ${!isDb ? `<div class="admin-warn-box">ℹ️ Database Supabase belum disambungkan. Batas <b>1 Perangkat</b> berlaku selama server aktif; untuk batas 1 perangkat permanen (tahan restart/serverless), hubungkan Supabase.</div>` : ''}
+      <form class="admin-create-card" id="adm-create-form" autocomplete="off">
+        <div class="admin-form-grid">
+          <div class="admin-field">
+            <label for="adm-code">Kode Kustom (Opsional)</label>
+            <input id="adm-code" type="text" maxlength="32" placeholder="Kosongkan = Auto" style="text-transform:uppercase" />
+          </div>
+          <div class="admin-field">
+            <label for="adm-label">Nama / Catatan</label>
+            <input id="adm-label" type="text" maxlength="50" placeholder="Misal: Andi / VIP" />
+          </div>
+          <div class="admin-field">
+            <label for="adm-uses">Batas Perangkat / Pemakaian</label>
+            <select id="adm-uses">
+              <option value="1" selected>1 Perangkat saja (Default)</option>
+              <option value="2">2 Perangkat</option>
+              <option value="3">3 Perangkat</option>
+              <option value="5">5 Perangkat</option>
+              <option value="0">Tanpa Batas</option>
+            </select>
+          </div>
+          <div class="admin-field">
+            <label for="adm-exp">Masa Berlaku</label>
+            <select id="adm-exp">
+              <option value="0">Selamanya</option>
+              <option value="1">1 Hari</option>
+              <option value="7">7 Hari</option>
+              <option value="30" selected>30 Hari</option>
+              <option value="90">90 Hari</option>
+            </select>
+          </div>
+        </div>
+        <div class="pl-form-actions">
+          <button type="button" class="pill-btn" id="adm-close">Tutup</button>
+          <button type="submit" class="pill-btn primary" id="adm-create-btn">${icon('i-plus')}<span>Buat Kode Akses</span></button>
+        </div>
+      </form>
+      <div class="admin-codes-head">
+        <span>Daftar Kode (${codes.length})</span>
+        <button type="button" class="admin-mini-btn" id="adm-refresh">Refresh</button>
+      </div>
+      <div class="admin-codes-list" id="adm-codes-list">${rowsHtml}</div>
+    `;
+
+    $('#adm-close').addEventListener('click', closeModal);
+    $('#adm-logout').addEventListener('click', () => {
+      setAdminToken('');
+      toast('Keluar dari Panel Admin');
+      openAdminModal();
+    });
+    $('#adm-refresh').addEventListener('click', () => openAdminModal());
+
+    $('#adm-create-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = $('#adm-create-btn');
+      if (btn) btn.disabled = true;
+      try {
+        const r = await fetch('/api/admin/codes', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${getAdminToken()}`,
+          },
+          body: JSON.stringify({
+            code: ($('#adm-code').value || '').trim(),
+            label: ($('#adm-label').value || '').trim(),
+            maxUses: Number($('#adm-uses').value) || 0,
+            expiresInDays: Number($('#adm-exp').value) || 0,
+          }),
+        });
+        const resJson = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          toast(resJson.error || 'Gagal membuat kode');
+          if (btn) btn.disabled = false;
+          return;
+        }
+        const created = resJson.code;
+        if (created && created.code) {
+          try { await navigator.clipboard?.writeText(created.code); } catch {}
+          toast(`Kode "${created.code}" dibuat & disalin!`);
+          codes.unshift(created);
+          renderDashboard(codes);
+        } else {
+          openAdminModal();
+        }
+      } catch {
+        toast('Error membuat kode');
+        if (btn) btn.disabled = false;
+      }
+    });
+
+    $$('[data-act]', $('#adm-codes-list')).forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const act = btn.dataset.act;
+        const code = btn.dataset.code;
+        if (!code) return;
+        if (act === 'copy') {
+          try {
+            await navigator.clipboard?.writeText(code);
+            toast(`Kode "${code}" disalin`);
+          } catch {
+            toast(`Kode: ${code}`);
+          }
+          return;
+        }
+        if (act === 'toggle') {
+          const nextActive = btn.dataset.active !== '1';
+          const r = await fetch(`/api/admin/codes/${encodeURIComponent(code)}`, {
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${getAdminToken()}`,
+            },
+            body: JSON.stringify({ active: nextActive }),
+          });
+          if (r.ok) {
+            const target = codes.find((x) => x.code === code);
+            if (target) target.active = nextActive;
+            renderDashboard(codes);
+            toast(nextActive ? `Kode ${code} diaktifkan` : `Kode ${code} dinonaktifkan`);
+          }
+          return;
+        }
+        if (act === 'del') {
+          const r = await fetch(`/api/admin/codes/${encodeURIComponent(code)}`, {
+            method: 'DELETE',
+            headers: { Authorization: `Bearer ${getAdminToken()}` },
+          });
+          if (r.ok) {
+            const nextList = codes.filter((x) => x.code !== code);
+            renderDashboard(nextList);
+            toast(`Kode ${code} dihapus`);
+          }
+        }
+      });
+    });
+  };
+
+  renderDashboard(data.codes || []);
+}
+
+function openSettingsModal() {
+  const modal = $('#modal');
+  const card = $('.modal-card');
+  const body = $('#modal-body');
+  const actions = $('.modal-actions');
+  if (card) card.classList.remove('wide');
   if (actions) actions.classList.remove('hidden');
   $('#modal-title').textContent = 'Spotify Settings';
   const row = (act, ic, label, on) =>
     `<button type="button" class="modal-row${on ? ' on' : ''}" data-setact="${act}">${icon(ic)}<span>${label}</span></button>`;
+  const accessLabel = Access.unlocked
+    ? `Akses Musik · Terbuka (${Access.info?.label || 'Aktif'}) — Ketuk untuk Kunci`
+    : 'Akses Musik · Terkunci — Masukkan Kode';
   body.innerHTML = `
+    ${row('access', Access.unlocked ? 'i-key' : 'i-lock', accessLabel, Access.unlocked)}
+    ${row('admin', 'i-lock', 'Panel Admin · Kelola Kode Akses', false)}
     ${row('bg', 'i-radio', Player.bgMode ? 'Background Audio · On (Screen Off Ready)' : 'Background Audio · Off', Player.bgMode)}
     ${row('autoplay', 'i-radio', Player.autoplay ? 'Autoplay Radio · On' : 'Autoplay Radio · Off', Player.autoplay)}
     ${row('sb', 'i-next', Player.sbEnabled ? 'SponsorBlock Auto-Skip · On' : 'SponsorBlock Auto-Skip · Off', Player.sbEnabled)}
@@ -3993,8 +4625,27 @@ function openSettingsModal() {
     ${row('restore', 'i-upload', 'Restore Library (JSON)')}
     ${row('stats', 'i-chart', 'Listening Stats')}
     <div class="settings-credit">© Spotify · modify by <strong>@ilhamm.18</strong> on insta</div>`;
-  $$('[data-setact]', body).forEach((b) => b.addEventListener('click', () => {
+  $$('[data-setact]', body).forEach((b) => b.addEventListener('click', async () => {
     const a = b.dataset.setact;
+    if (a === 'access') {
+      if (Access.unlocked) {
+        await fetch('/api/access/lock', { method: 'POST' }).catch(() => {});
+        Access.unlocked = false;
+        Access.token = '';
+        Access.info = null;
+        store.set('access_token', '');
+        store.set('access_info', null);
+        userPause();
+        stopBgAudio();
+        stopYtPlayer();
+        toast('Pemutaran dikunci kembali');
+        openSettingsModal();
+      } else {
+        openAccessLockModal();
+      }
+      return;
+    }
+    if (a === 'admin') { openAdminModal(); return; }
     if (a === 'bg') { toggleBackgroundMode(); openSettingsModal(); return; }
     if (a === 'autoplay') { toggleAutoplay(); openSettingsModal(); return; }
     if (a === 'sb') { toggleSB(); openSettingsModal(); return; }
@@ -4068,5 +4719,7 @@ document.addEventListener('error', (e) => {
 }, true);
 window.addEventListener('pagehide', persistQueue);
 document.addEventListener('visibilitychange', () => { if (document.hidden) persistQueue(); });
-restoreQueue();
-route();
+syncAccessStatus().finally(() => {
+  restoreQueue();
+  route();
+});

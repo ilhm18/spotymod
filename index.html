@@ -22,6 +22,9 @@
 <meta name="apple-mobile-web-app-title" content="Spotify" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="preconnect" href="https://www.youtube.com" />
+<link rel="preconnect" href="https://s.ytimg.com" />
+<link rel="preconnect" href="https://i.ytimg.com" />
 <link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800;900&display=swap" rel="stylesheet" />
 <link rel="preload" as="image" href="/spotify-logo.png" />
 <link rel="stylesheet" href="/styles.css" />
@@ -82,6 +85,8 @@
   <symbol id="i-grid" viewBox="0 0 24 24"><path d="M4 4h7v7H4zm9 0h7v7h-7zm-9 9h7v7H4zm9 0h7v7h-7z"/></symbol>
   <symbol id="i-settings" viewBox="0 0 24 24"><path d="m19.14 12.94.46-1.57-2.07-.37c-.12-.48-.28-.95-.49-1.4l1.37-1.59-1.27-1.27-1.59 1.37c-.45-.21-.92-.37-1.4-.49L13.77 5.5h-1.57l-.37 2.07c-.48.12-.95.28-1.4.49L8.84 6.69 7.57 7.96l1.37 1.59c-.21.45-.37.92-.49 1.4L6.38 11.3v1.57l2.07.37c.12.48.28.95.49 1.4L7.57 16.23l1.27 1.27 1.59-1.37c.45.21.92.37 1.4.49l.37 2.07h1.57l.37-2.07c.48-.12.95-.28 1.4-.49l1.59 1.37 1.27-1.27-1.37-1.59c.21-.45.37-.92.49-1.4l2.07-.37zM12 15.5c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z"/></symbol>
   <symbol id="i-user" viewBox="0 0 24 24"><path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8V21.6h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><path d="M17 10h-1V7a4 4 0 0 0-8 0v3H7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2zm-7-3a2 2 0 1 1 4 0v3h-4V7zm3 9.73V18h-2v-1.27a2 2 0 1 1 2 0z"/></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><path d="M12.65 10A6 6 0 1 0 7 18a5.97 5.97 0 0 0 5.65-4H17v3h3v-3h2v-4h-9.35zM7 14a2 2 0 1 1 0-4 2 2 0 0 1 0 4z"/></symbol>
   <symbol id="i-spotify" viewBox="0 0 24 24"><path d="M12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2zm4.586 14.424c-.18.295-.563.387-.857.207-2.348-1.435-5.304-1.76-8.785-.964-.335.077-.67-.133-.746-.469-.077-.336.132-.67.469-.746 3.809-.871 7.077-.496 9.713 1.115.293.18.386.563.206.857zm1.223-2.723c-.226.367-.706.482-1.072.257-2.687-1.652-6.785-2.131-9.965-1.166-.413.127-.848-.106-.973-.517-.125-.413.108-.848.52-.973 3.632-1.102 8.147-.568 11.234 1.328.366.226.48.707.256 1.071zm.105-2.835C14.692 8.95 9.375 8.775 6.297 9.71c-.493.15-1.016-.128-1.166-.62-.149-.493.129-1.016.621-1.166 3.532-1.073 9.404-.865 13.115 1.338.445.264.59.838.327 1.282-.264.443-.839.59-1.28.322z"/></symbol>
 </svg>
 
@@ -111,6 +116,10 @@
   <!-- Main -->
   <main id="main">
     <div id="topbar">
+      <button type="button" class="tb-brand" id="tb-brand-btn" title="Spotify Home">
+        <img src="/spotify-logo.png" width="28" height="28" alt="Spotify" />
+        <span>Spotify</span>
+      </button>
       <div class="tb-search-wrap">
         <svg class="ic"><use href="#i-search"/></svg>
         <input type="text" id="tb-search-input" placeholder="What do you want to play?" autocomplete="off" spellcheck="false" />
