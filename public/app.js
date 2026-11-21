@@ -22,6 +22,15 @@ const fmtTime = (s) => {
   return `${m}:${String(sec).padStart(2, '0')}`;
 };
 
+function shuffleArray(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
 function toast(msg) {
   const t = $('#toast');
   t.textContent = msg;
@@ -254,34 +263,99 @@ function accessHeaders(extra = {}) {
   if (Access.token) h['x-access-token'] = Access.token;
   return h;
 }
+function toB64u(buf) {
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function fromB64u(str) {
+  const b64 = String(str || '').replace(/-/g, '+').replace(/_/g, '/');
+  const pad = b64 + '==='.slice((b64.length + 3) % 4);
+  const bin = atob(pad);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+let _rpcSrvKeyPromise = null;
+async function getRpcServerKey() {
+  if (_rpcSrvKeyPromise) return _rpcSrvKeyPromise;
+  _rpcSrvKeyPromise = (async () => {
+    const r = await fetch('/api/v1/cfg', { cache: 'no-store' });
+    if (!r.ok) throw new Error('cfg');
+    const j = await r.json();
+    const raw = fromB64u(j.p);
+    return crypto.subtle.importKey('raw', raw, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  })();
+  _rpcSrvKeyPromise.catch(() => { _rpcSrvKeyPromise = null; });
+  return _rpcSrvKeyPromise;
+}
+async function secureRpc(act, payload = {}) {
+  const srvKey = await getRpcServerKey();
+  const kp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const sharedBits = await crypto.subtle.deriveBits({ name: 'ECDH', public: srvKey }, kp.privateKey, 256);
+  const cliPubRaw = new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey));
+  const sharedBytes = new Uint8Array(sharedBits);
+  const cat = new Uint8Array(sharedBytes.length + cliPubRaw.length);
+  cat.set(sharedBytes, 0);
+  cat.set(cliPubRaw, sharedBytes.length);
+  const aesHash = await crypto.subtle.digest('SHA-256', cat);
+  const aesKey = await crypto.subtle.importKey('raw', aesHash, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plainBytes = new TextEncoder().encode(JSON.stringify({
+    a: act,
+    p: payload,
+    tok: Access.token || '',
+    auth: getAdminToken() || '',
+    did: getDeviceId(),
+    t: Date.now(),
+  }));
+  const ctBuf = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, plainBytes);
+  const r = await fetch('/api/v1/rpc', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    cache: 'no-store',
+    body: JSON.stringify({ e: 1, k: toB64u(cliPubRaw), n: toB64u(iv), d: toB64u(ctBuf) }),
+  });
+  if (!r.ok) return { ok: false, status: r.status, data: {} };
+  const env = await r.json();
+  if (!env || env.e !== 1 || !env.n || !env.d) return { ok: false, status: 500, data: {} };
+  const respPlain = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: fromB64u(env.n) },
+    aesKey,
+    fromB64u(env.d)
+  );
+  const data = JSON.parse(new TextDecoder().decode(respPlain));
+  const st = Number(data?.status) || 200;
+  return { ok: st >= 200 && st < 300, status: st, data };
+}
+
 const Access = {
   unlocked: false,
   checked: false,
   token: store.get('access_token', ''),
-  info: store.get('access_info', null),
+  info: null,
   storage: 'signed',
   _pendingAction: null,
   _statusPromise: null,
 };
+store.set('access_info', null);
 
 async function syncAccessStatus(force = false) {
   if (Access._statusPromise && !force) return Access._statusPromise;
   Access._statusPromise = (async () => {
     try {
-      const r = await fetch('/api/access/status', { headers: accessHeaders() });
-      if (r.ok) {
-        const d = await r.json();
+      const { ok, data: d } = await secureRpc('s');
+      if (ok && d) {
         Access.unlocked = !!d.unlocked;
         Access.storage = d.storage || 'signed';
         Access.checked = true;
         if (d.unlocked) {
           Access.info = { label: d.label || 'Akses Aktif', code: d.code || '', expiresAt: d.expiresAt || null };
-          store.set('access_info', Access.info);
         } else {
           Access.token = '';
           Access.info = null;
           store.set('access_token', '');
-          store.set('access_info', null);
         }
       }
     } catch {
@@ -1407,6 +1481,8 @@ function updateLyricHighlight(cur) {
 function renderNowPlaying() {
   const mini = Player.current;
   const np = Player.pending || Player.current;
+  const cap = $('.np-caption');
+  if (cap) cap.textContent = Player.context || 'Now Playing';
   if (mini) {
     $('#mini-art').src = mini.thumbnail || '';
     const mt = $('#mini-title');
@@ -1809,7 +1885,7 @@ function safeCover(src) {
 function coverHTML(src, kind = '') {
   const u = safeCover(src);
   if (!u) return `<div class="art-ph${kind ? ' art-ph-' + kind : ''}">${icon('i-note')}</div>`;
-  return `<img loading="lazy" src="${esc(u)}" alt="">`;
+  return `<img loading="lazy" referrerpolicy="no-referrer" src="${esc(u)}" alt="">`;
 }
 function cardHTML(it) {
   const cls = it.type === 'artist' ? 'card artist' : 'card';
@@ -1844,10 +1920,16 @@ function trackHeadHTML() {
   return `<div class="track-head" aria-hidden="true"><span class="th-n">#</span><span class="th-t">Title</span><span class="th-d">Time</span></div>`;
 }
 function quickCardHTML(it) {
-  return `<button class="quick-card" data-item='${esc(JSON.stringify(it))}'>
-    ${coverHTML(it.thumbnail, 'quick')}
+  const isNav = !!it.navHash;
+  const thumbHtml = it.special === 'liked'
+    ? `<div class="qc-ph qc-ph-liked">${icon('i-heart-f')}</div>`
+    : it.special === 'trending'
+      ? `<div class="qc-ph qc-ph-trending">${icon('i-fire')}</div>`
+      : coverHTML(it.thumbnail, 'quick');
+  return `<button type="button" class="quick-card" ${isNav ? `data-nav="${esc(it.navHash)}"` : `data-item='${esc(JSON.stringify(it))}'`} data-tint="${esc(it.title || '')}">
+    ${thumbHtml}
     <span class="qc-t">${esc(it.title)}</span>
-    <span class="play-ov">${icon('i-play')}</span>
+    <span class="play-ov" aria-label="Play">${icon('i-play')}</span>
   </button>`;
 }
 function carouselHTML(inner) {
@@ -1874,7 +1956,7 @@ function likedCardHTML() {
   return `<div class="card liked-card" data-nav="#/library/favorites">
     <div class="art liked-cover">${icon('i-heart-f', 'ic liked-heart')}<div class="play-ov">${icon('i-play')}</div></div>
     <div class="t">Liked Songs</div>
-    <div class="s">${n} song${n === 1 ? '' : 's'}</div>
+    <div class="s">Playlist · ${n} song${n === 1 ? '' : 's'}</div>
   </div>`;
 }
 /* Shared Spotify-style detail header (big gradient cover, huge title, actions).
@@ -1883,7 +1965,7 @@ function detailHeadHTML(opts) {
   const { kicker = '', title = '', subtitle = '', cover = '', gradient = '', actions = '' } = opts || {};
   let coverHtml;
   if (safeCover(cover)) {
-    coverHtml = `<img src="${esc(cover)}" alt="">`;
+    coverHtml = `<img referrerpolicy="no-referrer" src="${esc(cover)}" alt="">`;
   } else if (gradient === 'liked') {
     coverHtml = `<div class="detail-ph liked">${icon('i-heart-f')}</div>`;
   } else {
@@ -1900,11 +1982,15 @@ function detailHeadHTML(opts) {
   </div>`;
 }
 function shelfHTML(sec) {
+  const moreBtn = sec.moreHash
+    ? `<button type="button" class="see-all-btn" data-go="${esc(sec.moreHash)}">Show all</button>`
+    : '';
+  const head = `<div class="shelf-head"><div class="shelf-title">${esc(sec.title)}</div>${moreBtn}</div>`;
   if (sec.list) {
-    return `<div class="shelf"><div class="shelf-title">${esc(sec.title)}</div>
+    return `<div class="shelf">${head}
       <div class="track-list">${sec.items.map((i) => (i.videoId ? trackRowHTML(i) : cardHTML(i))).join('')}</div></div>`;
   }
-  return `<div class="shelf"><div class="shelf-title">${esc(sec.title)}</div>
+  return `<div class="shelf">${head}
     ${carouselHTML(sec.items.map(cardHTML).join(''))}</div>`;
 }
 function bindCarousels(root) {
@@ -2034,17 +2120,16 @@ function openSongNowPlaying(song) {
 const NAV_DESKTOP = [
   { id: 'home', label: 'Home', icon: 'i-home-o', iconActive: 'i-home', hash: '#/home' },
   { id: 'search', label: 'Search', icon: 'i-search', iconActive: 'i-search', hash: '#/search' },
-  { id: 'library', label: 'Library', icon: 'i-library', iconActive: 'i-library', hash: '#/library' },
-  { id: 'favorites', label: 'Liked Songs', icon: 'i-heart-o', iconActive: 'i-heart-f', hash: '#/library/favorites' },
-  { id: 'history', label: 'Recently Played', icon: 'i-clock', iconActive: 'i-clock', hash: '#/library/history' },
+  { id: 'charts', label: 'Trending', icon: 'i-fire', iconActive: 'i-fire', hash: '#/charts' },
   { id: 'stats', label: 'Your Mix', icon: 'i-chart', iconActive: 'i-chart', hash: '#/stats' },
 ];
 const NAV_MOBILE = [
   { id: 'home', label: 'Home', icon: 'i-home-o', iconActive: 'i-home', hash: '#/home' },
   { id: 'search', label: 'Search', icon: 'i-search', iconActive: 'i-search', hash: '#/search' },
   { id: 'charts', label: 'Trending', icon: 'i-fire', iconActive: 'i-fire', hash: '#/charts' },
-  { id: 'library', label: 'Library', icon: 'i-library', iconActive: 'i-library', hash: '#/library' },
+  { id: 'library', label: 'Your Library', icon: 'i-library', iconActive: 'i-library', hash: '#/library' },
 ];
+let sideLibFilter = 'all';
 function renderNav() {
   const navDesktop = $('#nav-desktop');
   const navMobile = $('#nav-mobile');
@@ -2058,6 +2143,13 @@ function renderNav() {
       `<button type="button" class="nav-item" data-id="${n.id}" data-ic="${n.icon}" data-ica="${n.iconActive}" onclick="location.hash='${n.hash}'"><svg class="ic"><use href="#${n.icon}"/></svg><span>${n.label}</span></button>`
     ).join('');
   }
+  $$('#side-lib-chips .lib-chip').forEach((ch) => {
+    ch.addEventListener('click', () => {
+      sideLibFilter = ch.dataset.libf || 'all';
+      $$('#side-lib-chips .lib-chip').forEach((x) => x.classList.toggle('active', x === ch));
+      renderSidebarLibrary();
+    });
+  });
   renderSidebarLibrary();
 }
 function setActiveNav(id) {
@@ -2067,55 +2159,92 @@ function setActiveNav(id) {
     const use = el.querySelector('use');
     if (use) use.setAttribute('href', '#' + (active ? el.dataset.ica : el.dataset.ic));
   });
+  const tbHome = $('#tb-home');
+  if (tbHome) {
+    tbHome.classList.toggle('active', id === 'home');
+    const use = tbHome.querySelector('use');
+    if (use) use.setAttribute('href', id === 'home' ? '#i-home' : '#i-home-o');
+  }
 }
 
-/* ---- Sidebar Playlists (Spotify left rail) ---- */
+/* ---- Sidebar Library (Official Spotify 48x48 2-line rows) ---- */
 const CURATED_SIDE_PLAYLISTS = [
-  { id: 'indohits', name: 'Top Hits Indonesia', hash: '#/search/Lagu%20Hits%20Indonesia', icon: 'i-fire', color: 'c-emerald' },
-  { id: 'chill', name: 'Chill Vibes', hash: '#/search/Musik%20Santai%20Indonesia', icon: 'i-moon', color: 'c-cyan' },
-  { id: 'popindo', name: 'Pop Indonesia', hash: '#/search/Pop%20Indonesia%20Terbaru', icon: 'i-disc', color: 'c-purple' },
+  { id: 'indohits', name: 'Top Hits Indonesia', sub: 'Playlist · Spotify', hash: '#/search/Lagu%20Hits%20Indonesia', icon: 'i-fire', color: 'c-emerald' },
+  { id: 'chill', name: 'Chill Vibes Indonesia', sub: 'Playlist · Spotify', hash: '#/search/Musik%20Santai%20Indonesia', icon: 'i-moon', color: 'c-cyan' },
+  { id: 'popindo', name: 'Pop Indonesia', sub: 'Playlist · Spotify', hash: '#/search/Pop%20Indonesia%20Terbaru', icon: 'i-disc', color: 'c-purple' },
 ];
 function renderSidebarLibrary() {
   const sideEl = $('#side-playlists');
   if (!sideEl) return;
   const pls = Library.playlists;
   const favs = Library.favorites;
+  const saved = Library.saved;
   const rows = [];
 
-  if (pls.length) {
-    pls.forEach((p, idx) => {
-      const thumb = p.tracks && p.tracks[0] && safeCover(p.tracks[0].thumbnail);
-      const colors = ['c-purple', 'c-red', 'c-amber', 'c-cyan', 'c-emerald'];
-      const iconHtml = thumb
-        ? `<img src="${esc(thumb)}" alt="">`
-        : icon('i-note');
-      rows.push(`<button type="button" class="side-pl-row" data-nav="#/localpl/${esc(p.id)}" title="${esc(p.name)}">
-        <span class="side-pl-icon ${thumb ? '' : colors[idx % colors.length]}">${iconHtml}</span>
-        <span class="side-pl-title">${esc(p.name)}</span>
-      </button>`);
-    });
-  } else {
-    rows.push(`<button type="button" class="side-pl-row" data-act="newpl" title="Create your first playlist">
-      <span class="side-pl-icon c-purple">${icon('i-note')}</span>
-      <span class="side-pl-title">My Playlist</span>
+  if (sideLibFilter === 'all' || sideLibFilter === 'favorites') {
+    rows.push(`<button type="button" class="lib-row" data-nav="#/library/favorites" title="Liked Songs">
+      <div class="lib-ph liked-ph">${icon('i-heart-f')}</div>
+      <div class="lr-meta">
+        <div class="lr-t">Liked Songs</div>
+        <div class="lr-s">Playlist · ${favs.length} song${favs.length === 1 ? '' : 's'}</div>
+      </div>
     </button>`);
   }
 
-  rows.push(`<button type="button" class="side-pl-row" data-nav="#/library/favorites" title="Liked Songs (${favs.length})">
-    <span class="side-pl-icon c-amber">${icon('i-star')}</span>
-    <span class="side-pl-title">Favorites</span>
-  </button>`);
+  if (sideLibFilter === 'all' || sideLibFilter === 'playlists') {
+    if (pls.length) {
+      pls.forEach((p, idx) => {
+        const thumb = p.tracks && p.tracks[0] && safeCover(p.tracks[0].thumbnail);
+        const colors = ['c-purple', 'c-red', 'c-amber', 'c-cyan', 'c-emerald'];
+        const count = (p.tracks || []).length;
+        const art = thumb
+          ? `<img referrerpolicy="no-referrer" src="${esc(thumb)}" alt="">`
+          : `<div class="lib-ph side-pl-icon ${colors[idx % colors.length]}">${icon('i-note')}</div>`;
+        rows.push(`<button type="button" class="lib-row" data-nav="#/localpl/${esc(p.id)}" title="${esc(p.name)}">
+          ${art}
+          <div class="lr-meta">
+            <div class="lr-t">${esc(p.name)}</div>
+            <div class="lr-s">Playlist · ${count} song${count === 1 ? '' : 's'}</div>
+          </div>
+        </button>`);
+      });
+    } else if (sideLibFilter === 'playlists') {
+      rows.push(`<button type="button" class="lib-row" data-act="newpl" title="Create playlist">
+        <div class="lib-ph">${icon('i-plus')}</div>
+        <div class="lr-meta">
+          <div class="lr-t">Create your first playlist</div>
+          <div class="lr-s">It’s easy, we’ll help you</div>
+        </div>
+      </button>`);
+    }
+    CURATED_SIDE_PLAYLISTS.forEach((c) => {
+      rows.push(`<button type="button" class="lib-row" data-nav="${esc(c.hash)}" title="${esc(c.name)}">
+        <div class="lib-ph side-pl-icon ${c.color}">${icon(c.icon)}</div>
+        <div class="lr-meta">
+          <div class="lr-t">${esc(c.name)}</div>
+          <div class="lr-s">${esc(c.sub)}</div>
+        </div>
+      </button>`);
+    });
+  }
 
-  CURATED_SIDE_PLAYLISTS.forEach((c) => {
-    rows.push(`<button type="button" class="side-pl-row" data-nav="${esc(c.hash)}" title="${esc(c.name)}">
-      <span class="side-pl-icon ${c.color}">${icon(c.icon)}</span>
-      <span class="side-pl-title">${esc(c.name)}</span>
-    </button>`);
-  });
-
-  rows.push(`<button type="button" class="side-pl-more" data-nav="#/library">
-    <span>More</span>${icon('i-chev-down')}
-  </button>`);
+  if (sideLibFilter === 'all' || sideLibFilter === 'saved') {
+    saved.slice(0, 10).forEach((sv) => {
+      const isArtist = sv.type === 'artist' || sv.browseType === 'artist';
+      const kind = isArtist ? 'Artist' : (sv.type === 'album' ? 'Album' : 'Playlist');
+      const target = isArtist ? `#/artist/${sv.browseId}` : (sv.type === 'album' ? `#/album/${sv.browseId}` : `#/playlist/${sv.browseId}`);
+      rows.push(`<button type="button" class="lib-row${isArtist ? ' round' : ''}" data-nav="${esc(target)}" title="${esc(sv.title)}">
+        ${coverHTML(sv.thumbnail, 'lib')}
+        <div class="lr-meta">
+          <div class="lr-t">${esc(sv.title)}</div>
+          <div class="lr-s">${esc(kind)}${sv.subtitle ? ' · ' + esc(sv.subtitle) : ''}</div>
+        </div>
+      </button>`);
+    });
+    if (sideLibFilter === 'saved' && !saved.length) {
+      rows.push(`<div class="lib-empty">Tap <b>Save</b> on any album, playlist, or artist to pin it here.</div>`);
+    }
+  }
 
   sideEl.innerHTML = rows.join('');
   $$('[data-nav]', sideEl).forEach((b) => b.addEventListener('click', () => go(b.dataset.nav)));
@@ -2180,18 +2309,21 @@ async function route() {
 }
 window.addEventListener('hashchange', route);
 
-const skeletonHTML = `<div class="skeleton" style="width:100%;height:260px;border-radius:18px;margin-bottom:22px"></div>` + Array(2).fill(`
-  <div class="shelf"><div class="skeleton" style="width:180px;height:22px;margin-bottom:12px"></div>
-  <div class="carousel">${Array(6).fill('<div><div class="skeleton" style="width:160px;height:160px"></div></div>').join('')}</div></div>`).join('');
+const skeletonHTML = `
+  <div class="chip-row" style="margin-bottom:18px">
+    <div class="skeleton" style="width:52px;height:32px;border-radius:999px"></div>
+    <div class="skeleton" style="width:68px;height:32px;border-radius:999px"></div>
+    <div class="skeleton" style="width:84px;height:32px;border-radius:999px"></div>
+  </div>
+  <div class="quick-grid" style="margin-bottom:28px">
+    ${Array(8).fill('<div class="skeleton" style="height:56px;border-radius:4px"></div>').join('')}
+  </div>` + Array(3).fill(`
+  <div class="shelf"><div class="skeleton" style="width:200px;height:24px;margin-bottom:14px"></div>
+  <div class="carousel">${Array(6).fill('<div style="padding:12px"><div class="skeleton" style="width:148px;height:148px;border-radius:6px"></div></div>').join('')}</div></div>`).join('');
 
-const HERO_SLIDES = [
-  { badge: 'SPOTIFY INDONESIA', title: 'Trending & Hits Indonesia', tagline: 'Dengarkan musik tanpa iklan dengan kualitas audio tinggi • Putar di latar belakang', browse: '#/charts' },
-  { badge: 'DAILY MIX', title: 'Pop & Viral Tanah Air', tagline: 'Lagu-lagu paling sering diputar & viral di Indonesia hari ini', browse: '#/search/Lagu%20Viral%20Indonesia' },
-  { badge: 'CHILL VIBES', title: 'Santai & Akustik Indonesia', tagline: 'Alunan santai, indie folk, dan akustik favorit untuk menemani harimu', browse: '#/search/Akustik%20Santai%20Indonesia' },
-  { badge: 'JELAJAHI', title: 'Mood & Tangga Lagu', tagline: 'Temukan playlist, album, dan impor langsung dari tautan Spotify', browse: '#/moods' },
-];
+let homeFilter = 'all';
 
-/* ---- Home ---- */
+/* ---- Home (Official Spotify Layout) ---- */
 async function viewHome(view) {
   view.innerHTML = skeletonHTML;
   const now = new Date();
@@ -2205,7 +2337,6 @@ async function viewHome(view) {
   const saved = Library.saved.slice(0, 12);
   const sections = Array.isArray(d.sections) ? d.sections : [];
 
-  // Collect real playable tracks from home sections to power "Play Now" and fallback shelf
   const featuredTracks = [];
   sections.forEach((sec) => {
     (sec.items || []).forEach((it) => {
@@ -2215,185 +2346,165 @@ async function viewHome(view) {
     });
   });
 
-  const slide = HERO_SLIDES[0];
-  let html = `
-    <section class="hero-banner-wrap" aria-label="Spotify Featured Banner">
-      <div class="hero-emblem-bg" aria-hidden="true">
-        <img src="/spotify-logo.png" alt="" />
-      </div>
-      <div class="hero-gradient"></div>
-      <div class="hero-content">
-        <div class="hero-kicker">
-          <img class="hero-spotify-ic" src="/spotify-logo.png" alt="Spotify" />
-          <span class="hero-badge-text">${esc(slide.badge)}</span>
-        </div>
-        <h2 class="hero-brand-title">${esc(slide.title)}</h2>
-        <div class="hero-tagline">${esc(slide.tagline)}</div>
-        <div class="hero-actions">
-          <button type="button" class="hero-play-btn" id="hero-play-btn">${icon('i-play')}<span>Play Now</span></button>
-          <button type="button" class="hero-browse-btn" id="hero-browse-btn"><span>Browse Music</span>${icon('i-fwd')}</button>
-        </div>
-      </div>
-      <div class="hero-dots" role="tablist" aria-label="Banner slides">
-        ${HERO_SLIDES.map((_, i) => `<button type="button" class="hdot${i === 0 ? ' active' : ''}" data-slide="${i}" aria-label="Slide ${i + 1}"></button>`).join('')}
-      </div>
-    </section>
-
-    <section class="quick-category-row" aria-label="Quick categories">
-      <button type="button" class="qc-card qc-trending" data-go="#/charts">
-        <span class="qc-icon-wrap">${icon('i-fire')}</span>
-        <span class="qc-title">Trending Now</span>
-        ${icon('i-fwd', 'ic qc-chevron')}
-      </button>
-      <button type="button" class="qc-card qc-charts" data-go="#/charts">
-        <span class="qc-icon-wrap">${icon('i-note')}</span>
-        <span class="qc-title">Top Charts</span>
-        ${icon('i-fwd', 'ic qc-chevron')}
-      </button>
-      <button type="button" class="qc-card qc-releases" data-go="#/moods">
-        <span class="qc-icon-wrap">${icon('i-disc')}</span>
-        <span class="qc-title">New Releases</span>
-        ${icon('i-fwd', 'ic qc-chevron')}
-      </button>
-      <button type="button" class="qc-card qc-favorites" data-go="#/library/favorites">
-        <span class="qc-icon-wrap">${icon('i-star')}</span>
-        <span class="qc-title">Your Favorites</span>
-        ${icon('i-fwd', 'ic qc-chevron')}
-      </button>
-      <button type="button" class="qc-card qc-browse" data-go="#/search">
-        <span class="qc-icon-wrap">${icon('i-grid')}</span>
-        <span class="qc-title">Browse All</span>
-        ${icon('i-fwd', 'ic qc-chevron')}
-      </button>
-    </section>`;
-
-  if (hist.length) {
-    html += `<div class="shelf">
-      <div class="shelf-head">
-        <div class="shelf-title">${icon('i-clock')}<span>Recently Played</span></div>
-        <button type="button" class="see-all-btn" data-go="#/library/history"><span>See All</span>${icon('i-fwd')}</button>
-      </div>
-      ${carouselHTML(hist.slice(0, 12).map((s) => cardHTML({ ...s, type: 'song', subtitle: s.artist || '' })).join(''))}
-    </div>`;
+  // Build authentic Spotify 2x4 Quick-Pick tiles
+  const quickItems = [];
+  const seenKeys = new Set();
+  quickItems.push({ title: 'Liked Songs', navHash: '#/library/favorites', special: 'liked' });
+  quickItems.push({ title: 'Trending Indonesia', navHash: '#/charts', special: 'trending' });
+  for (const p of pls) {
+    if (quickItems.length >= 8) break;
+    quickItems.push({ title: p.name, thumbnail: p.tracks[0]?.thumbnail || '', navHash: `#/localpl/${p.id}`, tracks: p.tracks });
+  }
+  for (const s of hist) {
+    if (quickItems.length >= 8) break;
+    if (seenKeys.has(s.videoId)) continue;
+    seenKeys.add(s.videoId);
+    quickItems.push({ ...s, type: 'song', subtitle: s.artist || '' });
+  }
+  for (const sec of sections) {
+    if (quickItems.length >= 8) break;
+    for (const it of (sec.items || [])) {
+      if (quickItems.length >= 8) break;
+      const key = it.videoId || it.browseId || it.title;
+      if (!key || seenKeys.has(key)) continue;
+      seenKeys.add(key);
+      quickItems.push(it);
+    }
   }
 
-  html += `<div id="mix-slot"></div>`;
-  if (favs.length) {
-    html += `<div class="shelf">
-      <div class="shelf-head">
-        <div class="shelf-title">Liked Songs</div>
-        <button type="button" class="see-all-btn" data-go="#/library/favorites"><span>See All</span>${icon('i-fwd')}</button>
-      </div>
-      ${carouselHTML(favs.map((s) => cardHTML({ ...s, type: 'song', subtitle: s.artist })).join(''))}
-    </div>`;
-  }
-  if (pls.length) {
-    html += `<div class="shelf"><div class="shelf-title">Your Playlists</div>
-      ${carouselHTML(pls.map((p) => `<div class="card" data-pl="${esc(p.id)}">
-        <div class="art">${coverHTML(p.tracks[0] && p.tracks[0].thumbnail)}<div class="play-ov">${icon('i-play')}</div></div>
-        <div class="t">${esc(p.name)}</div><div class="s">${p.tracks.length} songs</div>
-      </div>`).join(''))}</div>`;
-  }
-  if (saved.length) {
-    html += `<div class="shelf"><div class="shelf-title">Saved</div>
-      ${carouselHTML(saved.map(cardHTML).join(''))}</div>`;
-  }
-  html += sections.map(shelfHTML).join('');
-  view.innerHTML = html;
-  bindItems(view);
+  const filterChips = [
+    ['all', 'All'],
+    ['music', 'Music'],
+    ['trending', 'Trending'],
+    ['moods', 'Moods'],
+  ];
 
-  $$('[data-go]', view).forEach((el) => el.addEventListener('click', () => go(el.dataset.go)));
-  $$('[data-pl]', view).forEach((el) => el.addEventListener('click', () => go(`#/localpl/${el.dataset.pl}`)));
+  const renderHomeContent = async (activeFilter) => {
+    let bodyHtml = '';
 
-  // Hero banner interactions
-  let activeSlide = 0;
-  const setHeroSlide = (idx) => {
-    activeSlide = (idx + HERO_SLIDES.length) % HERO_SLIDES.length;
-    const sl = HERO_SLIDES[activeSlide] || HERO_SLIDES[0];
-    $$('.hdot', view).forEach((d2, i) => d2.classList.toggle('active', i === activeSlide));
-    const badgeEl = $('.hero-badge-text', view);
-    const titleEl = $('.hero-brand-title', view);
-    const tagEl = $('.hero-tagline', view);
-    if (badgeEl) badgeEl.textContent = sl.badge;
-    if (titleEl) titleEl.textContent = sl.title;
-    if (tagEl) tagEl.textContent = sl.tagline;
+    if (activeFilter === 'moods') {
+      bodyHtml = `<div class="shelf"><div class="shelf-head"><div class="shelf-title">Browse by Mood & Genre</div><button type="button" class="see-all-btn" data-go="#/moods">Show all</button></div><div class="mood-grid" id="home-moods-grid"><div class="loading-note">Loading…</div></div></div>`;
+    } else if (activeFilter === 'trending') {
+      bodyHtml = `<div id="home-trending-slot"><div class="loading-note">Memuat Trending Indonesia…</div></div>`;
+    } else {
+      bodyHtml += `<section class="quick-grid" aria-label="Jump back in">${quickItems.slice(0, 8).map(quickCardHTML).join('')}</section>`;
+      if (hist.length) {
+        bodyHtml += shelfHTML({
+          title: 'Jump back in',
+          moreHash: '#/library/history',
+          items: hist.slice(0, 12).map((s) => ({ ...s, type: 'song', subtitle: s.artist || '' })),
+        });
+      }
+      bodyHtml += `<div id="mix-slot"></div>`;
+      if (favs.length && activeFilter === 'all') {
+        bodyHtml += shelfHTML({
+          title: 'Your Favorites',
+          moreHash: '#/library/favorites',
+          items: favs.map((s) => ({ ...s, type: 'song', subtitle: s.artist })),
+        });
+      }
+      if (pls.length) {
+        bodyHtml += `<div class="shelf"><div class="shelf-head"><div class="shelf-title">Your Playlists</div><button type="button" class="see-all-btn" data-go="#/library">Show all</button></div>
+          ${carouselHTML(pls.map((p) => `<div class="card" data-pl="${esc(p.id)}">
+            <div class="art">${coverHTML(p.tracks[0] && p.tracks[0].thumbnail)}<div class="play-ov">${icon('i-play')}</div></div>
+            <div class="t">${esc(p.name)}</div><div class="s">Playlist · ${p.tracks.length} song${p.tracks.length === 1 ? '' : 's'}</div>
+          </div>`).join(''))}</div>`;
+      }
+      if (saved.length && activeFilter === 'all') {
+        bodyHtml += shelfHTML({ title: 'Saved Collections', moreHash: '#/library/saved', items: saved });
+      }
+      const filteredSections = activeFilter === 'music'
+        ? sections.filter((sec) => (sec.items || []).some((it) => it.videoId || it.type === 'song' || it.type === 'album' || it.type === 'playlist'))
+        : sections;
+      bodyHtml += filteredSections.map((sec) => shelfHTML(sec)).join('');
+    }
+
+    const slot = $('#home-body-slot', view);
+    if (!slot) return;
+    slot.innerHTML = bodyHtml;
+    bindItems(slot);
+    $$('[data-go]', slot).forEach((el) => el.addEventListener('click', () => go(el.dataset.go)));
+    $$('[data-pl]', slot).forEach((el) => el.addEventListener('click', () => go(`#/localpl/${el.dataset.pl}`)));
+    $$('.quick-card[data-nav]', slot).forEach((el) => {
+      el.addEventListener('click', (e) => {
+        if (e.target.closest('.play-ov') && el.dataset.nav === '#/library/favorites' && favs.length) {
+          e.stopPropagation();
+          playSong(favs[0], [...favs], 0, 'Liked Songs');
+          return;
+        }
+        if (e.target.closest('.play-ov') && el.dataset.nav === '#/charts' && featuredTracks.length) {
+          e.stopPropagation();
+          playSong(featuredTracks[0], featuredTracks, 0, 'Trending Indonesia');
+          return;
+        }
+        go(el.dataset.nav);
+      });
+    });
+    // Spotify dynamic top ambient tint on quick-tile hover
+    $$('.quick-card', slot).forEach((card) => {
+      card.addEventListener('pointerenter', () => applyTint(card.dataset.tint || greet));
+    });
+
+    if (activeFilter === 'all' || activeFilter === 'music') {
+      loadMixForYou();
+    }
+    if (activeFilter === 'moods') {
+      try {
+        const md = await api('/api/moods');
+        const mg = $('#home-moods-grid', slot);
+        if (mg) {
+          mg.innerHTML = (md.categories || []).slice(0, 18).map(moodCardHTML).join('');
+          bindMoods(mg);
+        }
+      } catch {}
+    }
+    if (activeFilter === 'trending') {
+      try {
+        const cd = await api('/api/charts');
+        const ts = $('#home-trending-slot', slot);
+        if (ts) {
+          const secs = cd.sections || [];
+          let chHtml = '';
+          secs.forEach((sec) => {
+            const items = sec.items || [];
+            if (!items.length) return;
+            if (sec.list) {
+              const ranked = items.map((it, idx) => (it.videoId ? { ...it, tn: idx + 1 } : it));
+              chHtml += `<div class="shelf"><div class="shelf-head"><div class="shelf-title">${esc(sec.title)}</div><button type="button" class="see-all-btn" data-go="#/charts">Show all</button></div>${trackHeadHTML()}<div class="track-list">${ranked.slice(0, 15).map((i) => (i.videoId ? trackRowHTML(i) : cardHTML(i))).join('')}</div></div>`;
+            } else {
+              chHtml += shelfHTML({ ...sec, moreHash: '#/charts' });
+            }
+          });
+          ts.innerHTML = chHtml || emptyHTML('Belum ada data trending', 'Coba lagi sebentar.', { ic: 'i-fire' });
+          bindItems(ts);
+          $$('[data-go]', ts).forEach((el) => el.addEventListener('click', () => go(el.dataset.go)));
+        }
+      } catch {}
+    }
   };
 
-  clearInterval(window._heroTimer);
-  window._heroTimer = setInterval(() => {
-    setHeroSlide(activeSlide + 1);
-  }, 4500);
+  view.innerHTML = `
+    <div class="home-chips chip-row" role="tablist" aria-label="Home filter">
+      ${filterChips.map(([id, lbl]) => `<button type="button" class="chip${homeFilter === id ? ' active' : ''}" data-hf="${id}">${lbl}</button>`).join('')}
+    </div>
+    <div id="home-body-slot"></div>`;
 
-  const bannerWrap = $('.hero-banner-wrap', view);
-  if (bannerWrap) {
-    bannerWrap.addEventListener('mouseenter', () => clearInterval(window._heroTimer));
-    bannerWrap.addEventListener('mouseleave', () => {
-      clearInterval(window._heroTimer);
-      window._heroTimer = setInterval(() => setHeroSlide(activeSlide + 1), 4500);
-    });
-    let touchStartX = 0;
-    let touchStartY = 0;
-    let didSwipe = false;
-    bannerWrap.addEventListener('pointerdown', (e) => {
-      touchStartX = e.clientX;
-      touchStartY = e.clientY;
-      didSwipe = false;
-    }, { passive: true });
-    bannerWrap.addEventListener('pointerup', (e) => {
-      const dx = e.clientX - touchStartX;
-      const dy = e.clientY - touchStartY;
-      if (Math.abs(dx) > 35 && Math.abs(dx) > Math.abs(dy)) {
-        didSwipe = true;
-        if (dx > 0) setHeroSlide(activeSlide - 1);
-        else setHeroSlide(activeSlide + 1);
-      }
-    }, { passive: true });
-    bannerWrap.addEventListener('click', (e) => {
-      if (didSwipe) {
-        didSwipe = false;
-        e.preventDefault();
-        e.stopPropagation();
-      }
-    }, true);
-  }
-  window.addEventListener('hashchange', () => clearInterval(window._heroTimer), { once: true });
-
-  const playHeroBtn = $('#hero-play-btn', view);
-  const browseHeroBtn = $('#hero-browse-btn', view);
-  if (playHeroBtn) {
-    playHeroBtn.addEventListener('click', async () => {
-      const queueSource = hist.length ? hist : (favs.length ? favs : featuredTracks);
-      if (queueSource.length) {
-        playSong(queueSource[0], queueSource, 0, 'Hits Indonesia Mix');
-        return;
-      }
-      try {
-        const res = await api('/api/search?q=Lagu%20Hits%20Indonesia&filter=songs');
-        const songs = (res.sections || []).flatMap((s) => s.items || []).filter((i) => i.videoId);
-        if (songs.length) playSong(songs[0], songs, 0, 'Hits Indonesia');
-        else go('#/charts');
-      } catch {
-        go('#/charts');
-      }
-    });
-  }
-  if (browseHeroBtn) {
-    browseHeroBtn.addEventListener('click', () => go(HERO_SLIDES[activeSlide].browse));
-  }
-  $$('.hdot', view).forEach((dot) => {
-    dot.addEventListener('click', () => {
-      setHeroSlide(Number(dot.dataset.slide) || 0);
+  $$('.home-chips .chip', view).forEach((ch) => {
+    ch.addEventListener('click', () => {
+      homeFilter = ch.dataset.hf || 'all';
+      $$('.home-chips .chip', view).forEach((x) => x.classList.toggle('active', x === ch));
+      renderHomeContent(homeFilter);
     });
   });
+
+  await renderHomeContent(homeFilter);
 
   // Pre-warm top tracks so the very first click plays without cold-start delay
   const warmList = hist.length ? [...hist.slice(0, 1), ...featuredTracks.slice(0, 2)] : (favs.length ? [...favs.slice(0, 1), ...featuredTracks.slice(0, 2)] : featuredTracks.slice(0, 2));
   warmList.forEach((s) => prefetchSong(songFromItem(s)));
-
-  loadMixForYou();
 }
 
-/* "Mix for you" — personalized-feel shelf built from your listening history (no account needed) */
+/* "Made For You" — personalized-feel shelf built from your listening history */
 async function loadMixForYou() {
   const hist = Library.history;
   const seeds = [...Library.favorites, ...hist].filter((s) => s.videoId);
@@ -2407,7 +2518,7 @@ async function loadMixForYou() {
       type: 'song', videoId: q.videoId, title: q.title, subtitle: q.artist, thumbnail: q.thumbnail,
     }));
     if (!items.length) return;
-    slot.innerHTML = shelfHTML({ title: `Mix for you · based on “${seed.title}”`, items });
+    slot.innerHTML = shelfHTML({ title: `Made For You · Based on “${seed.title}”`, items });
     bindItems(slot);
   } catch {}
 }
@@ -2430,7 +2541,7 @@ function isSearchCard(it) {
 function moodCardHTML(c, i) {
   const raw = String(c.color || '').trim();
   const color = /^#?[0-9a-fA-F]{3,8}$/.test(raw) ? (raw[0] === '#' ? raw : '#' + raw) : MOOD_COLORS[i % MOOD_COLORS.length];
-  return `<button type="button" class="mood-card" style="--mc:${esc(color)}" data-b="${esc(c.browseId)}" data-p="${esc(c.params || '')}">${esc(c.title)}</button>`;
+  return `<button type="button" class="mood-card" style="--mc:${esc(color)}" data-b="${esc(c.browseId)}" data-p="${esc(c.params || '')}"><span>${esc(c.title)}</span></button>`;
 }
 function bindMoods(root) {
   $$('.mood-card', root).forEach((el) => el.addEventListener('click', () => {
@@ -2439,16 +2550,15 @@ function bindMoods(root) {
 }
 function topResultHTML(it) {
   const kind = it.type === 'artist' ? 'artist' : '';
-  const cta = it.videoId ? 'Play' : 'Open';
-  const ic = it.videoId ? 'i-play' : (it.type === 'artist' ? 'i-search' : 'i-fwd');
+  const typeTag = it.type ? (it.type[0].toUpperCase() + it.type.slice(1)) : 'Result';
+  const sub = [typeTag, it.subtitle || it.artist || ''].filter(Boolean).join(' · ');
   return `<button type="button" class="sr-top ${kind}" data-item='${esc(JSON.stringify(it))}'>
     ${coverHTML(it.thumbnail, 'sr')}
     <div class="sr-meta">
-      <div class="sr-kicker">Top result</div>
       <div class="sr-title">${esc(displayTitle(it.title) || it.title)}</div>
-      <div class="sr-sub">${esc(it.subtitle || it.artist || '')}</div>
-      <span class="pill-btn primary">${icon(ic)}<span>${cta}</span></span>
+      <div class="sr-sub">${esc(sub)}</div>
     </div>
+    <span class="play-ov" aria-hidden="true">${icon(it.videoId ? 'i-play' : 'i-fwd')}</span>
   </button>`;
 }
 function searchResultsHTML(sections) {
@@ -2456,10 +2566,11 @@ function searchResultsHTML(sections) {
     return emptyHTML('No results', 'Try a different spelling or another artist, song, or playlist.', { ic: 'i-search' });
   }
   let html = '';
+  let topCardHtml = '';
   const leftover = [];
   for (const sec of sections) {
     if (/^top result$/i.test(sec.title || '') && sec.items && sec.items[0]) {
-      html += topResultHTML(sec.items[0]);
+      topCardHtml = topResultHTML(sec.items[0]);
       continue;
     }
     leftover.push(...(sec.items || []));
@@ -2480,6 +2591,15 @@ function searchResultsHTML(sections) {
     if (!groups[t]) t = it.videoId ? 'song' : 'browse';
     groups[t].push(it);
   });
+  if (topCardHtml && groups.song.length) {
+    const topSongs = groups.song.splice(0, 4);
+    html += `<div class="search-top-grid">
+      <div class="shelf"><div class="shelf-title">Top result</div>${topCardHtml}</div>
+      <div class="shelf"><div class="shelf-title">Songs</div><div class="track-list">${topSongs.map((i) => trackRowHTML(i)).join('')}</div></div>
+    </div>`;
+  } else if (topCardHtml) {
+    html += `<div class="shelf"><div class="shelf-title">Top result</div>${topCardHtml}</div>`;
+  }
   ['song', 'video', 'album', 'artist', 'playlist', 'browse'].forEach((t) => {
     const items = groups[t];
     if (!items.length) return;
@@ -3151,7 +3271,7 @@ function closeModal() {
   const modal = $('#modal');
   if (modal) modal.classList.add('hidden');
   const card = $('.modal-card');
-  if (card) card.classList.remove('wide');
+  if (card) card.classList.remove('wide', 'lock-mode');
   const actions = $('.modal-actions');
   if (actions) actions.classList.remove('hidden');
 }
@@ -4259,12 +4379,17 @@ if ('serviceWorker' in navigator) {
   setTimeout(hide, 2800);
 })();
 function getAdminToken() {
-  try { return sessionStorage.getItem('smw_admin_tok') || ''; } catch { return ''; }
+  try { return localStorage.getItem('smw_admin_tok') || sessionStorage.getItem('smw_admin_tok') || ''; } catch { return ''; }
 }
 function setAdminToken(tok) {
   try {
-    if (tok) sessionStorage.setItem('smw_admin_tok', tok);
-    else sessionStorage.removeItem('smw_admin_tok');
+    if (tok) {
+      localStorage.setItem('smw_admin_tok', tok);
+      sessionStorage.setItem('smw_admin_tok', tok);
+    } else {
+      localStorage.removeItem('smw_admin_tok');
+      sessionStorage.removeItem('smw_admin_tok');
+    }
   } catch {}
 }
 
@@ -4273,21 +4398,24 @@ function openAccessLockModal(noticeMsg = '') {
   const card = $('.modal-card');
   const body = $('#modal-body');
   const actions = $('.modal-actions');
-  if (card) card.classList.remove('wide');
-  $('#modal-title').textContent = 'Pemutaran Musik Terkunci';
+  if (card) { card.classList.remove('wide'); card.classList.add('lock-mode'); }
+  $('#modal-title').textContent = 'LOCKED';
   if (actions) actions.classList.add('hidden');
   body.innerHTML = `<form class="pl-form" id="lock-form" autocomplete="off">
       <div class="pl-form-cover" aria-hidden="true">${icon('i-lock')}</div>
       <div class="lock-err${noticeMsg ? '' : ' hidden'}" id="lock-err">${esc(noticeMsg)}</div>
       <label class="pl-form-label" for="lock-code-input">Kode Akses</label>
       <input id="lock-code-input" class="pl-form-input" type="text" placeholder="Contoh: SP1-0-XXXX-XXXXXXXX" style="text-transform:uppercase;letter-spacing:0.05em" />
-      <div class="pl-form-hint">Aplikasi ini dikunci oleh Admin (maksimal 1 perangkat per kode). Masukkan kode akses yang Anda terima untuk memutar lagu.</div>
+      <div class="pl-form-hint">Aplikasi ini dikunci oleh Admin. Masukkan kode akses yang Anda terima untuk membuka kunci.</div>
       <div class="pl-form-actions">
         <button type="button" class="pill-btn" id="lock-cancel">Nanti</button>
         <button type="submit" class="pill-btn primary" id="lock-submit">${icon('i-key')}<span>Buka Akses</span></button>
       </div>
       <div class="lock-foot">
-        <span>Khusus pemilik web:</span>
+        <div>
+          mau buka akses?<br />
+          hubungi Instagram : <a href="https://instagram.com/ilhamm.18" target="_blank" rel="noopener noreferrer">@ilhamm.18</a>
+        </div>
         <button type="button" class="lock-admin-link" id="lock-open-admin">Panel Admin &rarr;</button>
       </div>
     </form>`;
@@ -4314,13 +4442,8 @@ function openAccessLockModal(noticeMsg = '') {
     if (errBox) errBox.classList.add('hidden');
     if (submitBtn) { submitBtn.disabled = true; submitBtn.innerHTML = icon('i-key') + '<span>Memeriksa…</span>'; }
     try {
-      const r = await fetch('/api/access/verify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-device-id': getDeviceId() },
-        body: JSON.stringify({ code, deviceId: getDeviceId() }),
-      });
-      const d = await r.json().catch(() => ({}));
-      if (!r.ok || !d.unlocked) {
+      const { ok, data: d } = await secureRpc('v', { code, deviceId: getDeviceId() });
+      if (!ok || !d.unlocked) {
         showErr(d.error || 'Kode akses tidak valid.');
         if (submitBtn) { submitBtn.disabled = false; submitBtn.innerHTML = icon('i-key') + '<span>Buka Akses</span>'; }
         return;
@@ -4331,7 +4454,6 @@ function openAccessLockModal(noticeMsg = '') {
       Access.info = { label: d.label || 'Akses Aktif', code: d.code || code, expiresAt: d.expiresAt || null };
       Access.storage = d.storage || Access.storage;
       store.set('access_token', Access.token);
-      store.set('access_info', Access.info);
       const pending = Access._pendingAction;
       Access._pendingAction = null;
       closeModal();
@@ -4351,7 +4473,7 @@ async function openAdminModal() {
   const card = $('.modal-card');
   const body = $('#modal-body');
   const actions = $('.modal-actions');
-  if (card) card.classList.add('wide');
+  if (card) { card.classList.remove('lock-mode'); card.classList.add('wide'); }
   if (actions) actions.classList.add('hidden');
 
   const tok = getAdminToken();
@@ -4362,7 +4484,7 @@ async function openAdminModal() {
         <div class="lock-err hidden" id="adm-err"></div>
         <label class="pl-form-label" for="adm-pw">Password Admin</label>
         <input id="adm-pw" class="pl-form-input" type="password" placeholder="Masukkan password admin..." />
-        <div class="pl-form-hint">Masukkan password admin yang diatur pada Environment Variable <b>ADMIN_PASSWORD</b>.</div>
+        <div class="pl-form-hint">Login Admin otomatis membuka akses pemutaran lagu tanpa perlu kode akses.</div>
         <div class="pl-form-actions">
           <button type="button" class="pill-btn" id="adm-cancel">Tutup</button>
           <button type="submit" class="pill-btn primary" id="adm-go">${icon('i-key')}<span>Masuk</span></button>
@@ -4379,18 +4501,30 @@ async function openAdminModal() {
       if (errEl) errEl.classList.add('hidden');
       if (goBtn) goBtn.disabled = true;
       try {
-        const r = await fetch('/api/admin/login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ password: pw }),
-        });
-        const d = await r.json().catch(() => ({}));
-        if (!r.ok || !d.adminToken) {
+        const { ok, data: d } = await secureRpc('al', { password: pw, deviceId: getDeviceId() });
+        if (!ok || !d.adminToken) {
           if (errEl) { errEl.textContent = d.error || 'Password salah.'; errEl.classList.remove('hidden'); }
           if (goBtn) goBtn.disabled = false;
           return;
         }
         setAdminToken(d.adminToken);
+        if (d.accessToken) {
+          Access.unlocked = true;
+          Access.checked = true;
+          Access.token = d.accessToken;
+          Access.info = d.accessInfo || { label: 'Admin (Tanpa Kode)', code: 'ADMIN', expiresAt: d.expiresAt || null };
+          Access.storage = d.storage || Access.storage;
+          store.set('access_token', Access.token);
+        }
+        const pending = Access._pendingAction;
+        Access._pendingAction = null;
+        if (typeof pending === 'function') {
+          closeModal();
+          toast('Login Admin berhasil — langsung memutar lagu!');
+          pending();
+          return;
+        }
+        toast('Login Admin berhasil — akses lagu terbuka!');
         openAdminModal();
       } catch {
         if (errEl) { errEl.textContent = 'Gagal terhubung ke server.'; errEl.classList.remove('hidden'); }
@@ -4407,14 +4541,13 @@ async function openAdminModal() {
   modal.classList.remove('hidden');
 
   const fetchCodes = async () => {
-    const r = await fetch('/api/admin/codes', { headers: { Authorization: `Bearer ${getAdminToken()}` } });
-    if (r.status === 401) {
+    const { ok, status, data: d } = await secureRpc('ac');
+    if (status === 401) {
       setAdminToken('');
       openAdminModal();
       return null;
     }
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(d.error || 'Gagal memuat kode');
+    if (!ok) throw new Error(d.error || 'Gagal memuat kode');
     return d;
   };
 
@@ -4424,38 +4557,167 @@ async function openAdminModal() {
     if (!data) return;
   } catch (e) {
     body.innerHTML = `<div class="lock-err">${esc(e.message || 'Gagal memuat panel admin')}</div>
-      <div class="pl-form-actions"><button type="button" class="pill-btn" id="adm-err-close">Tutup</button></div>`;
+      <div class="pl-form-actions">
+        <button type="button" class="pill-btn" id="adm-err-close">Tutup</button>
+        <button type="button" class="pill-btn primary" id="adm-err-retry">Coba Lagi</button>
+      </div>`;
     $('#adm-err-close').addEventListener('click', closeModal);
+    $('#adm-err-retry').addEventListener('click', () => openAdminModal());
     return;
   }
 
   const isDb = data.storage === 'supabase';
+  let codeSearchQuery = '';
   const renderDashboard = (codes) => {
-    const rowsHtml = codes.length
-      ? codes.map((c) => {
-          const usesTxt = c.max_uses === 1
-            ? `Maks 1 perangkat (${c.uses || 0}/1)`
-            : (c.max_uses > 0 ? `${c.uses || 0}/${c.max_uses} pakai` : `${c.uses || 0} pakai (tanpa batas)`);
-          const expTxt = c.expires_at ? `Exp: ${new Date(c.expires_at).toLocaleDateString('id-ID')}` : 'Selamanya';
-          return `<div class="admin-code-row${c.active ? '' : ' revoked'}" data-code="${esc(c.code)}">
-            <div class="admin-code-main">
-              <div class="admin-code-val">${esc(c.code)}</div>
-              <div class="admin-code-meta">${esc(c.label || 'Pengguna')} · ${esc(usesTxt)} · ${esc(expTxt)} · <b>${c.active ? 'Aktif' : 'Nonaktif'}</b></div>
-            </div>
-            <div class="admin-code-actions">
-              <button type="button" class="admin-mini-btn copy" data-act="copy" data-code="${esc(c.code)}">Salin</button>
-              <button type="button" class="admin-mini-btn" data-act="toggle" data-code="${esc(c.code)}" data-active="${c.active ? '1' : '0'}">${c.active ? 'Matikan' : 'Aktifkan'}</button>
-              <button type="button" class="admin-mini-btn danger" data-act="del" data-code="${esc(c.code)}">Hapus</button>
-            </div>
-          </div>`;
-        }).join('')
-      : `<div class="sq-empty" style="padding:12px 4px">${isDb
+    const buildRowsHtml = (list) => {
+      if (!list.length) {
+        if (codes.length && codeSearchQuery.trim()) {
+          return `<div class="sq-empty" style="padding:14px 4px">Tidak ada nama atau kode yang cocok dengan “${esc(codeSearchQuery.trim())}”.</div>`;
+        }
+        return `<div class="sq-empty" style="padding:12px 4px">${isDb
           ? 'Belum ada kode akses di Supabase. Buat kode pertama Anda di atas.'
           : 'Buat kode akses baru di atas lalu klik Salin untuk dikirim ke pengguna.'}</div>`;
+      }
+      return list.map((c) => {
+        const isUsed = (c.uses || 0) > 0 || !!(c.device_id || c.bound_device);
+        const usesTxt = c.max_uses === 1
+          ? (isUsed ? `Dipakai (1/1)` : `Kosong (0/1)`)
+          : (c.max_uses > 0 ? `${c.uses || 0}/${c.max_uses} perangkat` : `${c.uses || 0} aktif`);
+        const expTxt = c.expires_at ? `Exp: ${new Date(c.expires_at).toLocaleDateString('id-ID')}` : 'Selamanya';
+        const lastActive = c.last_active_at ? new Date(c.last_active_at).getTime() : 0;
+        const diffMs = lastActive ? Date.now() - lastActive : 0;
+        const isOnline = lastActive && diffMs < 120000;
+        let onlineTxt = '<span style="color:#aaa">⚪ Offline</span>';
+        if (isOnline) {
+          const activeSec = Math.floor(diffMs / 1000);
+          const activeMin = Math.floor(activeSec / 60);
+          const activeDur = activeMin > 0 ? `${activeMin}m` : `${activeSec}s`;
+          onlineTxt = `<span style="color:#1ed760; font-weight:700">🟢 Online (${activeDur})</span>`;
+        } else if (lastActive) {
+          const offlineMin = Math.floor(diffMs / 60000);
+          const offlineHr = Math.floor(offlineMin / 60);
+          const offlineStr = offlineHr > 0 ? `${offlineHr}j lalu` : `${offlineMin}m lalu`;
+          onlineTxt = `<span style="color:#aaa">⚪ Offline (${offlineStr})</span>`;
+        }
+        return `<div class="admin-code-row${c.active ? '' : ' revoked'}" data-code="${esc(c.code)}">
+          <div class="admin-code-main">
+            <div class="admin-code-val">${esc(c.code)}</div>
+            <div class="admin-code-meta">${esc(c.label || 'Pengguna')} · <b style="color:${isUsed ? '#ffd166' : '#1ed760'}">${esc(usesTxt)}</b> · ${esc(expTxt)} · ${onlineTxt} · <b>${c.active ? 'Aktif' : 'Nonaktif'}</b></div>
+          </div>
+          <div class="admin-code-actions">
+            <button type="button" class="admin-mini-btn copy" data-act="copy" data-code="${esc(c.code)}">Salin</button>
+            ${isUsed ? `<button type="button" class="admin-mini-btn" data-act="release" data-code="${esc(c.code)}" title="Kosongkan perangkat agar kode bisa dipakai lagi">Lepas</button>` : ''}
+            <button type="button" class="admin-mini-btn" data-act="extend" data-code="${esc(c.code)}">Perpanjang</button>
+            <button type="button" class="admin-mini-btn" data-act="toggle" data-code="${esc(c.code)}" data-active="${c.active ? '1' : '0'}">${c.active ? 'Matikan' : 'Aktifkan'}</button>
+            <button type="button" class="admin-mini-btn danger" data-act="del" data-code="${esc(c.code)}">Hapus</button>
+          </div>
+        </div>`;
+      }).join('');
+    };
+
+    const getFilteredCodes = () => {
+      const q = codeSearchQuery.trim().toLowerCase();
+      if (!q) return codes;
+      return codes.filter((c) => {
+        const codeStr = (c.code || '').toLowerCase();
+        const labelStr = (c.label || 'Pengguna').toLowerCase();
+        return codeStr.includes(q) || labelStr.includes(q);
+      });
+    };
+
+    const bindRowActions = () => {
+      const listEl = $('#adm-codes-list');
+      if (!listEl) return;
+      $$('[data-act]', listEl).forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const act = btn.dataset.act;
+          const code = btn.dataset.code;
+          if (!code) return;
+          if (act === 'copy') {
+            try {
+              await navigator.clipboard?.writeText(code);
+              toast(`Kode "${code}" disalin`);
+            } catch {
+              toast(`Kode: ${code}`);
+            }
+            return;
+          }
+          if (act === 'extend') {
+            const daysPrompt = prompt('Masukkan jumlah hari perpanjangan masa berlaku (contoh: 30):', '30');
+            const days = parseInt(daysPrompt, 10);
+            if (Number.isFinite(days) && days > 0) {
+              const { ok } = await secureRpc('ae', { code, days });
+              if (ok) {
+                toast(`Kode ${code} diperpanjang ${days} hari!`);
+                openAdminModal();
+              } else {
+                toast('Gagal memperpanjang kode');
+              }
+            }
+            return;
+          }
+          if (act === 'toggle') {
+            const nextActive = btn.dataset.active !== '1';
+            const { ok } = await secureRpc('at', { code, active: nextActive });
+            if (ok) {
+              const target = codes.find((x) => x.code === code);
+              if (target) target.active = nextActive;
+              refreshCodesList();
+              toast(nextActive ? `Kode ${code} diaktifkan` : `Kode ${code} dinonaktifkan`);
+            }
+            return;
+          }
+          if (act === 'release') {
+            const { ok } = await secureRpc('ar', { code });
+            if (ok) {
+              const target = codes.find((x) => x.code === code);
+              if (target) {
+                target.uses = 0;
+                target.device_id = null;
+                target.bound_device = null;
+              }
+              refreshCodesList();
+              toast(`Kode ${code} dilepas & kosong kembali — siap dipakai perangkat lain!`);
+            }
+            return;
+          }
+          if (act === 'del') {
+            const { ok } = await secureRpc('ad', { code });
+            if (ok) {
+              const nextList = codes.filter((x) => x.code !== code);
+              renderDashboard(nextList);
+              toast(`Kode ${code} dihapus`);
+            }
+          }
+        });
+      });
+    };
+
+    const refreshCodesList = () => {
+      const filtered = getFilteredCodes();
+      const countEl = $('#adm-codes-count');
+      if (countEl) {
+        countEl.textContent = codeSearchQuery.trim()
+          ? `Daftar Kode (${filtered.length} / ${codes.length})`
+          : `Daftar Kode (${codes.length})`;
+      }
+      const listEl = $('#adm-codes-list');
+      if (listEl) {
+        listEl.innerHTML = buildRowsHtml(filtered);
+        bindRowActions();
+      }
+      const clearBtn = $('#adm-code-search-clear');
+      if (clearBtn) clearBtn.classList.toggle('hidden', !codeSearchQuery.length);
+    };
+
+    const initialFiltered = getFilteredCodes();
+    const initialCountText = codeSearchQuery.trim()
+      ? `Daftar Kode (${initialFiltered.length} / ${codes.length})`
+      : `Daftar Kode (${codes.length})`;
 
     body.innerHTML = `
       <div class="admin-top-bar">
-        <span class="admin-status-badge${isDb ? ' db' : ''}">${isDb ? '● Supabase Terhubung' : '● Mode Tanpa Database (Signed Code)'}</span>
+        <span class="admin-status-badge${isDb ? ' db' : ''}">${isDb ? '● Database Terhubung' : '● Mode Tanpa Database (Signed Code)'}</span>
         <button type="button" class="admin-mini-btn" id="adm-logout">Keluar Admin</button>
       </div>
       ${data.usingDefaultPassword ? `<div class="admin-warn-box">⚠️ Masih memakai password admin default (<code>admin1234</code>). Segera set Environment Variable <b>ADMIN_PASSWORD</b> di Vercel / Secrets.</div>` : ''}
@@ -4468,7 +4730,7 @@ async function openAdminModal() {
           </div>
           <div class="admin-field">
             <label for="adm-label">Nama / Catatan</label>
-            <input id="adm-label" type="text" maxlength="50" placeholder="Misal: Andi / VIP" />
+            <input id="adm-label" type="text" maxlength="50" placeholder="Masukkan nama" />
           </div>
           <div class="admin-field">
             <label for="adm-uses">Batas Perangkat / Pemakaian</label>
@@ -4497,15 +4759,51 @@ async function openAdminModal() {
         </div>
       </form>
       <div class="admin-codes-head">
-        <span>Daftar Kode (${codes.length})</span>
+        <span id="adm-codes-count">${initialCountText}</span>
         <button type="button" class="admin-mini-btn" id="adm-refresh">Refresh</button>
       </div>
-      <div class="admin-codes-list" id="adm-codes-list">${rowsHtml}</div>
+      <div class="admin-search-wrap">
+        ${icon('i-search')}
+        <input type="text" id="adm-code-search" placeholder="Cari nama atau kode..." autocomplete="off" spellcheck="false" value="${esc(codeSearchQuery)}" />
+        <button type="button" id="adm-code-search-clear" class="admin-search-clear${codeSearchQuery ? '' : ' hidden'}" title="Hapus pencarian">${icon('i-x')}</button>
+      </div>
+      <div class="admin-codes-list" id="adm-codes-list">${buildRowsHtml(initialFiltered)}</div>
     `;
 
+    bindRowActions();
+
+    const searchInput = $('#adm-code-search');
+    const searchClear = $('#adm-code-search-clear');
+    if (searchInput) {
+      searchInput.addEventListener('input', () => {
+        codeSearchQuery = searchInput.value;
+        refreshCodesList();
+      });
+    }
+    if (searchClear) {
+      searchClear.addEventListener('click', () => {
+        codeSearchQuery = '';
+        if (searchInput) {
+          searchInput.value = '';
+          searchInput.focus();
+        }
+        refreshCodesList();
+      });
+    }
+
     $('#adm-close').addEventListener('click', closeModal);
-    $('#adm-logout').addEventListener('click', () => {
+    $('#adm-logout').addEventListener('click', async () => {
       setAdminToken('');
+      if (Access.info?.code === 'ADMIN') {
+        await secureRpc('l').catch(() => {});
+        Access.unlocked = false;
+        Access.token = '';
+        Access.info = null;
+        store.set('access_token', '');
+        userPause();
+        stopBgAudio();
+        stopYtPlayer();
+      }
       toast('Keluar dari Panel Admin');
       openAdminModal();
     });
@@ -4516,21 +4814,13 @@ async function openAdminModal() {
       const btn = $('#adm-create-btn');
       if (btn) btn.disabled = true;
       try {
-        const r = await fetch('/api/admin/codes', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${getAdminToken()}`,
-          },
-          body: JSON.stringify({
-            code: ($('#adm-code').value || '').trim(),
-            label: ($('#adm-label').value || '').trim(),
-            maxUses: Number($('#adm-uses').value) || 0,
-            expiresInDays: Number($('#adm-exp').value) || 0,
-          }),
+        const { ok, data: resJson } = await secureRpc('ak', {
+          code: ($('#adm-code').value || '').trim(),
+          label: ($('#adm-label').value || '').trim(),
+          maxUses: Number($('#adm-uses').value) || 0,
+          expiresInDays: Number($('#adm-exp').value) || 0,
         });
-        const resJson = await r.json().catch(() => ({}));
-        if (!r.ok) {
+        if (!ok) {
           toast(resJson.error || 'Gagal membuat kode');
           if (btn) btn.disabled = false;
           return;
@@ -4549,52 +4839,6 @@ async function openAdminModal() {
         if (btn) btn.disabled = false;
       }
     });
-
-    $$('[data-act]', $('#adm-codes-list')).forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        const act = btn.dataset.act;
-        const code = btn.dataset.code;
-        if (!code) return;
-        if (act === 'copy') {
-          try {
-            await navigator.clipboard?.writeText(code);
-            toast(`Kode "${code}" disalin`);
-          } catch {
-            toast(`Kode: ${code}`);
-          }
-          return;
-        }
-        if (act === 'toggle') {
-          const nextActive = btn.dataset.active !== '1';
-          const r = await fetch(`/api/admin/codes/${encodeURIComponent(code)}`, {
-            method: 'PATCH',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${getAdminToken()}`,
-            },
-            body: JSON.stringify({ active: nextActive }),
-          });
-          if (r.ok) {
-            const target = codes.find((x) => x.code === code);
-            if (target) target.active = nextActive;
-            renderDashboard(codes);
-            toast(nextActive ? `Kode ${code} diaktifkan` : `Kode ${code} dinonaktifkan`);
-          }
-          return;
-        }
-        if (act === 'del') {
-          const r = await fetch(`/api/admin/codes/${encodeURIComponent(code)}`, {
-            method: 'DELETE',
-            headers: { Authorization: `Bearer ${getAdminToken()}` },
-          });
-          if (r.ok) {
-            const nextList = codes.filter((x) => x.code !== code);
-            renderDashboard(nextList);
-            toast(`Kode ${code} dihapus`);
-          }
-        }
-      });
-    });
   };
 
   renderDashboard(data.codes || []);
@@ -4605,54 +4849,20 @@ function openSettingsModal() {
   const card = $('.modal-card');
   const body = $('#modal-body');
   const actions = $('.modal-actions');
-  if (card) card.classList.remove('wide');
+  if (card) card.classList.remove('wide', 'lock-mode');
   if (actions) actions.classList.remove('hidden');
   $('#modal-title').textContent = 'Spotify Settings';
   const row = (act, ic, label, on) =>
     `<button type="button" class="modal-row${on ? ' on' : ''}" data-setact="${act}">${icon(ic)}<span>${label}</span></button>`;
-  const accessLabel = Access.unlocked
-    ? `Akses Musik · Terbuka (${Access.info?.label || 'Aktif'}) — Ketuk untuk Kunci`
-    : 'Akses Musik · Terkunci — Masukkan Kode';
   body.innerHTML = `
-    ${row('access', Access.unlocked ? 'i-key' : 'i-lock', accessLabel, Access.unlocked)}
     ${row('admin', 'i-lock', 'Panel Admin · Kelola Kode Akses', false)}
-    ${row('bg', 'i-radio', Player.bgMode ? 'Background Audio · On (Screen Off Ready)' : 'Background Audio · Off', Player.bgMode)}
-    ${row('autoplay', 'i-radio', Player.autoplay ? 'Autoplay Radio · On' : 'Autoplay Radio · Off', Player.autoplay)}
-    ${row('sb', 'i-next', Player.sbEnabled ? 'SponsorBlock Auto-Skip · On' : 'SponsorBlock Auto-Skip · Off', Player.sbEnabled)}
     ${row('hq', 'i-expand', Player.hq ? 'Audio Quality · Max' : 'Audio Quality · Standard', Player.hq)}
-    ${row('import', 'i-download', 'Import from Spotify / YT Music')}
-    ${row('backup', 'i-download', 'Backup Library (JSON)')}
-    ${row('restore', 'i-upload', 'Restore Library (JSON)')}
     ${row('stats', 'i-chart', 'Listening Stats')}
     <div class="settings-credit">© Spotify · modify by <strong>@ilhamm.18</strong> on insta</div>`;
   $$('[data-setact]', body).forEach((b) => b.addEventListener('click', async () => {
     const a = b.dataset.setact;
-    if (a === 'access') {
-      if (Access.unlocked) {
-        await fetch('/api/access/lock', { method: 'POST' }).catch(() => {});
-        Access.unlocked = false;
-        Access.token = '';
-        Access.info = null;
-        store.set('access_token', '');
-        store.set('access_info', null);
-        userPause();
-        stopBgAudio();
-        stopYtPlayer();
-        toast('Pemutaran dikunci kembali');
-        openSettingsModal();
-      } else {
-        openAccessLockModal();
-      }
-      return;
-    }
     if (a === 'admin') { openAdminModal(); return; }
-    if (a === 'bg') { toggleBackgroundMode(); openSettingsModal(); return; }
-    if (a === 'autoplay') { toggleAutoplay(); openSettingsModal(); return; }
-    if (a === 'sb') { toggleSB(); openSettingsModal(); return; }
     if (a === 'hq') { toggleQuality(); openSettingsModal(); return; }
-    if (a === 'import') { openImportForm(); return; }
-    if (a === 'backup') { openBackupForm(); return; }
-    if (a === 'restore') { openRestoreForm(); return; }
     if (a === 'stats') { closeModal(); go('#/stats'); }
   }));
   modal.classList.remove('hidden');
@@ -4674,6 +4884,14 @@ if (tbSearchInput) {
     }
   });
 }
+const tbBackBtn = $('#tb-back');
+if (tbBackBtn) tbBackBtn.addEventListener('click', () => history.back());
+const tbFwdBtn = $('#tb-fwd');
+if (tbFwdBtn) tbFwdBtn.addEventListener('click', () => history.forward());
+const tbHomeBtn = $('#tb-home');
+if (tbHomeBtn) tbHomeBtn.addEventListener('click', () => go('#/home'));
+const tbBrowseBtn = $('#tb-browse');
+if (tbBrowseBtn) tbBrowseBtn.addEventListener('click', () => go('#/moods'));
 const logoHomeBtn = $('#logo-home-btn');
 if (logoHomeBtn) logoHomeBtn.addEventListener('click', () => go('#/home'));
 const tbBrandBtn = $('#tb-brand-btn');

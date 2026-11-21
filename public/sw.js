@@ -8,6 +8,6 @@ self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
    so background <audio> playback and seeking never stall through SW. */
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
-  if (url.pathname.startsWith('/api/stream') || event.request.headers.has('range')) return;
+  if (url.pathname.startsWith('/api/') || event.request.headers.has('range')) return;
   event.respondWith(fetch(event.request).catch(() => Response.error()));
 });

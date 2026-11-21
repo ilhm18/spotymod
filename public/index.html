@@ -102,8 +102,17 @@
     </div>
     <div class="side-box lib-box">
       <div class="lib-head">
-        <button class="lib-title" id="lib-title-btn" title="Open playlists"><svg class="ic"><use href="#i-library"/></svg><span>Your Library</span></button>
-        <button id="pl-new-side-btn" class="icon-btn" title="Create Playlist"><svg class="ic"><use href="#i-plus"/></svg></button>
+        <button class="lib-title" id="lib-title-btn" title="Your Library"><svg class="ic"><use href="#i-library"/></svg><span>Your Library</span></button>
+        <div class="lib-head-acts">
+          <button id="pl-new-side-btn" class="icon-btn" title="Create playlist"><svg class="ic"><use href="#i-plus"/></svg></button>
+        </div>
+      </div>
+      <div class="lib-chips" id="side-lib-chips" role="tablist" aria-label="Filter library">
+        <button type="button" class="lib-chip active" data-libf="all">All</button>
+        <button type="button" class="lib-chip" data-libf="playlists">Playlists</button>
+        <button type="button" class="lib-chip" data-libf="favorites">Liked</button>
+        <button type="button" class="lib-chip" data-libf="saved">Saved</button>
+        <button type="button" class="lib-chip" data-libf="downloads">Downloads</button>
       </div>
       <div id="side-playlists" class="side-playlists-list"></div>
       <div class="sidebar-footer">
@@ -120,9 +129,18 @@
         <img src="/spotify-logo.png" width="28" height="28" alt="Spotify" />
         <span>Spotify</span>
       </button>
-      <div class="tb-search-wrap">
-        <svg class="ic"><use href="#i-search"/></svg>
-        <input type="text" id="tb-search-input" placeholder="What do you want to play?" autocomplete="off" spellcheck="false" />
+      <div class="tb-nav" aria-label="History navigation">
+        <button type="button" id="tb-back" class="tb-nav-btn" title="Go back"><svg class="ic"><use href="#i-back"/></svg></button>
+        <button type="button" id="tb-fwd" class="tb-nav-btn" title="Go forward"><svg class="ic"><use href="#i-fwd"/></svg></button>
+      </div>
+      <div class="tb-center">
+        <button type="button" id="tb-home" class="tb-home-btn" title="Home"><svg class="ic"><use href="#i-home"/></svg></button>
+        <div class="tb-search-wrap">
+          <svg class="ic tb-search-ic"><use href="#i-search"/></svg>
+          <input type="text" id="tb-search-input" placeholder="What do you want to play?" autocomplete="off" spellcheck="false" />
+          <span class="tb-search-div" aria-hidden="true"></span>
+          <button type="button" id="tb-browse" class="tb-browse-btn" title="Browse"><svg class="ic"><use href="#i-grid"/></svg></button>
+        </div>
       </div>
       <div class="tb-actions">
         <button id="tb-settings" class="tb-btn" title="Settings &amp; Backup">

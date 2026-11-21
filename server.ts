@@ -46,6 +46,7 @@ interface AccessCodeRecord {
   active: boolean;
   expires_at: string | null;
   created_at: string;
+  last_active_at?: string | null;
   bound_device?: string | null;
   kind?: 'supabase' | 'signed' | 'memory';
 }
@@ -53,7 +54,10 @@ interface AccessCodeRecord {
 const localCodeStore = new Map<string, AccessCodeRecord>();
 const usedSignedDeviceMap = new Map<string, string>();
 const revokedLocalCodes = new Set<string>();
-const codeActiveCache = new Map<string, { ok: boolean; expiresAt: number }>();
+const codeActiveCache = new Map<
+  string,
+  { ok: boolean; expiresAt: number; uses: number; maxUses: number; deviceId: string | null }
+>();
 
 function safeEqualStr(a: string, b: string): boolean {
   const ab = Buffer.from(a);
@@ -66,14 +70,53 @@ function hmacSign(data: string, len = 24): string {
   return crypto.createHmac('sha256', TOKEN_SECRET).update(data).digest('hex').slice(0, len).toUpperCase();
 }
 
+const SESSION_AES_KEY = crypto.createHash('sha256').update(`session-aes:${TOKEN_SECRET}`).digest();
+
+function createServerEcdh() {
+  const ecdh = crypto.createECDH('prime256v1');
+  for (let i = 0; i < 16; i++) {
+    const priv = crypto.createHmac('sha256', TOKEN_SECRET).update(`ecdh-p256-v1:${i}`).digest();
+    try {
+      ecdh.setPrivateKey(priv);
+      return ecdh;
+    } catch {}
+  }
+  ecdh.generateKeys();
+  return ecdh;
+}
+const SERVER_ECDH = createServerEcdh();
+const SERVER_ECDH_PUB_B64U = SERVER_ECDH.getPublicKey(null, 'uncompressed').toString('base64url');
+
 function signSessionPayload(payload: Record<string, any>): string {
-  const b64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
-  const sig = crypto.createHmac('sha256', TOKEN_SECRET).update(b64).digest('base64url').slice(0, 32);
-  return `${b64}.${sig}`;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', SESSION_AES_KEY, iv);
+  const enc = Buffer.concat([cipher.update(JSON.stringify(payload), 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `v2.${iv.toString('base64url')}.${tag.toString('base64url')}.${enc.toString('base64url')}`;
 }
 
 function verifySessionToken(token: string): Record<string, any> | null {
   if (!token || typeof token !== 'string') return null;
+  if (token.startsWith('v2.')) {
+    const parts = token.split('.');
+    if (parts.length !== 4) return null;
+    try {
+      const iv = Buffer.from(parts[1], 'base64url');
+      const tag = Buffer.from(parts[2], 'base64url');
+      const enc = Buffer.from(parts[3], 'base64url');
+      if (iv.length !== 12 || tag.length !== 16) return null;
+      const decipher = crypto.createDecipheriv('aes-256-gcm', SESSION_AES_KEY, iv);
+      decipher.setAuthTag(tag);
+      const plain = Buffer.concat([decipher.update(enc), decipher.final()]).toString('utf8');
+      const obj = JSON.parse(plain);
+      if (!obj || typeof obj !== 'object') return null;
+      if (typeof obj.exp === 'number' && obj.exp > 0 && Date.now() > obj.exp) return null;
+      return obj;
+    } catch {
+      return null;
+    }
+  }
+  // Legacy v1 fallback
   const dot = token.indexOf('.');
   if (dot <= 0) return null;
   const b64 = token.slice(0, dot);
@@ -108,7 +151,8 @@ function parseCookies(cookieHeader: string | undefined): Record<string, string> 
   return out;
 }
 
-function extractAccessToken(req: Req): string {
+function extractAccessToken(req: Req, explicitToken = ''): string {
+  if (explicitToken && typeof explicitToken === 'string') return explicitToken.trim();
   const q = typeof req.query.token === 'string' ? req.query.token.trim() : '';
   if (q) return q;
   const h = req.headers['x-access-token'];
@@ -128,6 +172,11 @@ function setAccessCookie(res: Res, token: string | null, maxAgeSec = 90 * 24 * 3
     token ? `Max-Age=${maxAgeSec}` : 'Max-Age=0',
   ].filter(Boolean);
   res.setHeader('Set-Cookie', attrs.join('; '));
+}
+
+function setNoStore(res: Res) {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.setHeader('Pragma', 'no-cache');
 }
 
 function generateSignedCode(expiresAtMs: number | null): string {
@@ -166,51 +215,96 @@ function randomCodeString(): string {
 async function sbFetch(tablePath: string, init: RequestInit = {}): Promise<Response> {
   const headers: Record<string, string> = {
     apikey: SUPABASE_KEY,
-    Authorization: `Bearer ${SUPABASE_KEY}`,
+    ...(SUPABASE_KEY.startsWith('eyJ') ? { Authorization: `Bearer ${SUPABASE_KEY}` } : {}),
     'Content-Type': 'application/json',
     ...((init.headers as Record<string, string>) || {}),
   };
   return fetchTimeout(`${SUPABASE_URL}/rest/v1/${tablePath}`, { ...init, headers }, 6000);
 }
 
-async function isCodeActiveInSupabase(code: string): Promise<boolean> {
+async function isCodeActiveInSupabase(code: string, reqDid = ''): Promise<boolean> {
   if (!HAS_SUPABASE || !code) return true;
   const hit = codeActiveCache.get(code);
-  if (hit && hit.expiresAt > Date.now()) return hit.ok;
+  if (hit && hit.expiresAt > Date.now()) {
+    if (!hit.ok) return false;
+    if (hit.uses <= 0) return false;
+    if (hit.maxUses === 1 && hit.deviceId && reqDid && hit.deviceId !== reqDid) return false;
+    return true;
+  }
   try {
-    const r = await sbFetch(`access_codes?code=eq.${encodeURIComponent(code)}&select=active,expires_at`);
+    const r = await sbFetch(`access_codes?code=eq.${encodeURIComponent(code)}&select=*`);
     if (!r.ok) return true; // avoid breaking playback on transient DB hiccup
     const rows: any = await r.json();
     const row = Array.isArray(rows) ? rows[0] : null;
     let ok = false;
+    const uses = Number(row?.uses) || 0;
+    const maxUses = Number(row?.max_uses) || 0;
+    const deviceId = row?.device_id ? String(row.device_id) : null;
     if (row && row.active) {
       ok = !row.expires_at || Date.now() <= new Date(row.expires_at).getTime();
     }
-    codeActiveCache.set(code, { ok, expiresAt: Date.now() + 15_000 });
-    return ok;
+    codeActiveCache.set(code, { ok, expiresAt: Date.now() + 15_000, uses, maxUses, deviceId });
+    if (!ok || uses <= 0) return false;
+    if (maxUses === 1 && deviceId && reqDid && deviceId !== reqDid) return false;
+    return true;
   } catch {
     return true;
   }
 }
 
-async function getValidAccessPayload(req: Req): Promise<Record<string, any> | null> {
-  const token = extractAccessToken(req);
+async function releaseCodeSlot(code: string, reqDid = ''): Promise<void> {
+  if (!code || code === 'ADMIN') return;
+  codeActiveCache.delete(code);
+  if (HAS_SUPABASE) {
+    try {
+      const r = await sbFetch(`access_codes?code=eq.${encodeURIComponent(code)}&select=*`);
+      if (!r.ok) return;
+      const rows: any = await r.json();
+      const row = Array.isArray(rows) ? rows[0] : null;
+      if (!row) return;
+      const nextUses = Math.max(0, (Number(row.uses) || 0) - 1);
+      const patchBody: Record<string, any> = { uses: nextUses };
+      if ('device_id' in row && (row.device_id === reqDid || nextUses === 0)) {
+        patchBody.device_id = null;
+      }
+      await sbFetch(`access_codes?code=eq.${encodeURIComponent(code)}`, {
+        method: 'PATCH',
+        body: JSON.stringify(patchBody),
+      });
+    } catch {}
+    return;
+  }
+  const mem = localCodeStore.get(code);
+  if (mem) {
+    mem.uses = Math.max(0, (mem.uses || 0) - 1);
+    if (mem.bound_device === reqDid || mem.uses === 0) mem.bound_device = null;
+  }
+  const prevDid = usedSignedDeviceMap.get(code);
+  if (prevDid && (!reqDid || prevDid === reqDid)) {
+    usedSignedDeviceMap.delete(code);
+  }
+}
+
+async function getValidAccessPayload(req: Req, explicitToken = '', explicitDid = ''): Promise<Record<string, any> | null> {
+  const token = extractAccessToken(req, explicitToken);
   const payload = verifySessionToken(token);
-  if (!payload || payload.role !== 'listener') return null;
+  if (!payload || (payload.role !== 'listener' && payload.role !== 'admin_listener')) return null;
   const headerDid = typeof req.headers['x-device-id'] === 'string' ? req.headers['x-device-id'].trim() : '';
   const queryDid = typeof req.query.did === 'string' ? req.query.did.trim() : '';
-  const reqDid = headerDid || queryDid;
+  const reqDid = explicitDid.trim() || headerDid || queryDid;
   if (payload.did && (!reqDid || !safeEqualStr(String(payload.did), reqDid))) {
     return null;
   }
+  if (payload.role === 'admin_listener') return payload;
   const code = String(payload.code || '');
   if (HAS_SUPABASE && code) {
-    const ok = await isCodeActiveInSupabase(code);
+    const ok = await isCodeActiveInSupabase(code, reqDid);
     if (!ok) return null;
   } else if (code) {
     if (revokedLocalCodes.has(code)) return null;
     const mem = localCodeStore.get(code);
     if (mem && !mem.active) return null;
+    if (mem && mem.max_uses > 0 && mem.uses <= 0) return null;
     if (mem && mem.bound_device && reqDid && mem.bound_device !== reqDid) return null;
   }
   return payload;
@@ -223,43 +317,66 @@ async function requirePlaybackAccess(req: Req, res: Res): Promise<boolean> {
   return false;
 }
 
+function checkAdminToken(token: string): boolean {
+  const payload = verifySessionToken(token);
+  return Boolean(payload && payload.role === 'admin');
+}
+
 function requireAdminAuth(req: Req, res: Res): boolean {
   const auth = String(req.headers.authorization || '');
   const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
-  const payload = verifySessionToken(token);
-  if (!payload || payload.role !== 'admin') {
+  if (!checkAdminToken(token)) {
     res.status(401).json({ error: 'Unauthorized admin' });
     return false;
   }
   return true;
 }
 
-app.get('/api/access/status', async (req: Req, res: Res) => {
-  const payload = await getValidAccessPayload(req);
+async function opAccessStatus(req: Req, explicitToken = '', explicitDid = '') {
+  const payload = await getValidAccessPayload(req, explicitToken, explicitDid);
   if (!payload) {
-    return res.json({
-      unlocked: false,
-      lockEnabled: true,
-      storage: HAS_SUPABASE ? 'supabase' : 'signed',
-    });
+    return {
+      status: 200,
+      body: {
+        unlocked: false,
+        lockEnabled: true,
+        storage: HAS_SUPABASE ? 'supabase' : 'signed',
+      },
+    };
   }
-  return res.json({
-    unlocked: true,
-    lockEnabled: true,
-    label: payload.label || 'Akses Aktif',
-    code: payload.code || '',
-    expiresAt: payload.exp || null,
-    storage: HAS_SUPABASE ? 'supabase' : 'signed',
-  });
-});
+  if (payload && payload.code && payload.code !== 'ADMIN') {
+    const code = String(payload.code);
+    const nowIso = new Date().toISOString();
+    if (HAS_SUPABASE) {
+      sbFetch(`access_codes?code=eq.${encodeURIComponent(code)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ last_active_at: nowIso }),
+      }).catch(() => {});
+    } else {
+      const mem = localCodeStore.get(code);
+      if (mem) mem.last_active_at = nowIso;
+    }
+  }
+  return {
+    status: 200,
+    body: {
+      unlocked: true,
+      lockEnabled: true,
+      label: payload.label || 'Akses Aktif',
+      code: payload.code || '',
+      expiresAt: payload.exp || null,
+      storage: HAS_SUPABASE ? 'supabase' : 'signed',
+    },
+  };
+}
 
-app.post('/api/access/verify', async (req: Req, res: Res) => {
+async function opAccessVerify(res: Res, codeInput: string, didInput: string) {
   try {
-    const rawCode = String(req.body?.code || '').trim().toUpperCase();
-    const rawDid = String(req.body?.deviceId || req.headers['x-device-id'] || '').trim().slice(0, 64);
+    const rawCode = String(codeInput || '').trim().toUpperCase();
+    const rawDid = String(didInput || '').trim().slice(0, 64);
     const deviceId = rawDid || crypto.randomBytes(12).toString('hex');
     if (!rawCode || rawCode.length < 3) {
-      return res.status(400).json({ error: 'Masukkan kode akses terlebih dahulu.' });
+      return { status: 400, body: { error: 'Masukkan kode akses terlebih dahulu.' } };
     }
 
     let label = 'Akses Premium';
@@ -268,20 +385,20 @@ app.post('/api/access/verify', async (req: Req, res: Res) => {
     if (HAS_SUPABASE) {
       const r = await sbFetch(`access_codes?code=eq.${encodeURIComponent(rawCode)}&select=*`);
       if (!r.ok) {
-        return res.status(502).json({ error: 'Gagal memeriksa database kode akses. Cek koneksi Supabase.' });
+        return { status: 502, body: { error: 'Gagal memeriksa database kode akses. Cek koneksi Supabase.' } };
       }
       const rows: any = await r.json();
       const row = Array.isArray(rows) ? rows[0] : null;
       if (!row) {
-        return res.status(403).json({ error: 'Kode akses tidak ditemukan. Minta kode valid ke Admin.' });
+        return { status: 403, body: { error: 'Kode akses tidak ditemukan. Minta kode valid ke Admin.' } };
       }
       if (!row.active) {
-        return res.status(403).json({ error: 'Kode akses ini sudah dinonaktifkan oleh Admin.' });
+        return { status: 403, body: { error: 'Kode akses ini sudah dinonaktifkan oleh Admin.' } };
       }
       if (row.expires_at) {
         codeExpMs = new Date(row.expires_at).getTime();
         if (Number.isFinite(codeExpMs) && Date.now() > codeExpMs) {
-          return res.status(403).json({ error: 'Kode akses ini sudah kedaluwarsa.' });
+          return { status: 403, body: { error: 'Kode akses ini sudah kedaluwarsa.' } };
         }
       }
       const maxUses = Number(row.max_uses) || 0;
@@ -296,12 +413,15 @@ app.post('/api/access/verify', async (req: Req, res: Res) => {
 
       if (!sameBoundDevice) {
         if (maxUses > 0 && uses >= maxUses) {
-          return res.status(403).json({
-            error:
-              maxUses === 1
-                ? 'Kode ini dibatasi 1 perangkat dan sudah digunakan di perangkat lain.'
-                : 'Batas pemakaian kode ini sudah habis.',
-          });
+          return {
+            status: 403,
+            body: {
+              error:
+                maxUses === 1
+                  ? 'Kode ini dibatasi 1 perangkat dan sudah digunakan di perangkat lain.'
+                  : 'Batas pemakaian kode ini sudah habis.',
+            },
+          };
         }
 
         const patchBody: Record<string, any> = { uses: uses + 1 };
@@ -315,39 +435,45 @@ app.post('/api/access/verify', async (req: Req, res: Res) => {
           }
         );
         if (!patchRes.ok) {
-          return res.status(502).json({ error: 'Gagal memperbarui status kode akses.' });
+          return { status: 502, body: { error: 'Gagal memperbarui status kode akses.' } };
         }
         const updated: any = await patchRes.json().catch(() => []);
         if (maxUses > 0 && (!Array.isArray(updated) || !updated.length)) {
-          return res.status(403).json({
-            error:
-              maxUses === 1
-                ? 'Kode ini dibatasi 1 perangkat dan sudah digunakan di perangkat lain.'
-                : 'Batas pemakaian kode ini sudah habis.',
-          });
+          return {
+            status: 403,
+            body: {
+              error:
+                maxUses === 1
+                  ? 'Kode ini dibatasi 1 perangkat dan sudah digunakan di perangkat lain.'
+                  : 'Batas pemakaian kode ini sudah habis.',
+            },
+          };
         }
       }
       label = row.label || 'Akses Aktif';
-      codeActiveCache.set(rawCode, { ok: true, expiresAt: Date.now() + 15_000 });
+      codeActiveCache.delete(rawCode);
     } else {
       const mem = localCodeStore.get(rawCode);
       if (mem) {
         if (!mem.active) {
-          return res.status(403).json({ error: 'Kode akses ini sudah dinonaktifkan oleh Admin.' });
+          return { status: 403, body: { error: 'Kode akses ini sudah dinonaktifkan oleh Admin.' } };
         }
         if (mem.expires_at && Date.now() > new Date(mem.expires_at).getTime()) {
-          return res.status(403).json({ error: 'Kode akses ini sudah kedaluwarsa.' });
+          return { status: 403, body: { error: 'Kode akses ini sudah kedaluwarsa.' } };
         }
         const sameBoundDevice =
           mem.max_uses === 1 && mem.uses >= 1 && mem.bound_device && rawDid && mem.bound_device === rawDid;
         if (!sameBoundDevice) {
           if (mem.max_uses > 0 && mem.uses >= mem.max_uses) {
-            return res.status(403).json({
-              error:
-                mem.max_uses === 1
-                  ? 'Kode ini dibatasi 1 perangkat dan sudah digunakan di perangkat lain.'
-                  : 'Batas pemakaian kode ini sudah habis.',
-            });
+            return {
+              status: 403,
+              body: {
+                error:
+                  mem.max_uses === 1
+                    ? 'Kode ini dibatasi 1 perangkat dan sudah digunakan di perangkat lain.'
+                    : 'Batas pemakaian kode ini sudah habis.',
+              },
+            };
           }
           mem.uses += 1;
           if (!mem.bound_device && deviceId) mem.bound_device = deviceId;
@@ -356,15 +482,18 @@ app.post('/api/access/verify', async (req: Req, res: Res) => {
         codeExpMs = mem.expires_at ? new Date(mem.expires_at).getTime() : null;
       } else {
         if (revokedLocalCodes.has(rawCode)) {
-          return res.status(403).json({ error: 'Kode akses ini sudah dihapus atau dinonaktifkan Admin.' });
+          return { status: 403, body: { error: 'Kode akses ini sudah dihapus atau dinonaktifkan Admin.' } };
         }
         const signed = verifySignedCode(rawCode);
         if (!signed.valid) {
-          return res.status(403).json({ error: signed.reason && signed.reason !== 'format' ? signed.reason : 'Kode akses tidak valid. Hubungi Admin.' });
+          return {
+            status: 403,
+            body: { error: signed.reason && signed.reason !== 'format' ? signed.reason : 'Kode akses tidak valid. Hubungi Admin.' },
+          };
         }
         const prevDid = usedSignedDeviceMap.get(rawCode);
         if (prevDid && (!rawDid || prevDid !== rawDid)) {
-          return res.status(403).json({ error: 'Kode ini dibatasi 1 perangkat dan sudah digunakan di perangkat lain.' });
+          return { status: 403, body: { error: 'Kode ini dibatasi 1 perangkat dan sudah digunakan di perangkat lain.' } };
         }
         if (!prevDid) usedSignedDeviceMap.set(rawCode, deviceId);
         label = 'Kode Akses Resmi';
@@ -375,7 +504,7 @@ app.post('/api/access/verify', async (req: Req, res: Res) => {
     const defaultSessionExp = Date.now() + 90 * 24 * 3600 * 1000;
     const sessionExp = codeExpMs ? Math.min(codeExpMs, defaultSessionExp) : defaultSessionExp;
     const token = signSessionPayload({
-      v: 1,
+      v: 2,
       role: 'listener',
       code: rawCode,
       label,
@@ -383,83 +512,119 @@ app.post('/api/access/verify', async (req: Req, res: Res) => {
       exp: sessionExp,
     });
     setAccessCookie(res, token, Math.max(60, Math.floor((sessionExp - Date.now()) / 1000)));
-    return res.json({
-      ok: true,
-      unlocked: true,
-      token,
-      label,
-      code: rawCode,
-      expiresAt: sessionExp,
-      storage: HAS_SUPABASE ? 'supabase' : 'signed',
-    });
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        unlocked: true,
+        token,
+        label,
+        code: rawCode,
+        expiresAt: sessionExp,
+        storage: HAS_SUPABASE ? 'supabase' : 'signed',
+      },
+    };
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message || 'Gagal memverifikasi kode' });
+    return { status: 500, body: { error: e?.message || 'Gagal memverifikasi kode' } };
   }
-});
+}
 
-app.post('/api/access/lock', (_req: Req, res: Res) => {
+async function opAccessLock(req: Req, res: Res, explicitToken = '', explicitDid = '') {
+  const token = extractAccessToken(req, explicitToken);
+  const payload = verifySessionToken(token);
+  const headerDid = typeof req.headers['x-device-id'] === 'string' ? req.headers['x-device-id'].trim() : '';
+  const reqDid = explicitDid.trim() || headerDid || String(payload?.did || '');
+  let released = false;
+  if (payload && payload.role === 'listener' && payload.code) {
+    if (!payload.did || !reqDid || safeEqualStr(String(payload.did), reqDid)) {
+      await releaseCodeSlot(String(payload.code), reqDid);
+      released = true;
+    }
+  }
   setAccessCookie(res, null);
-  res.json({ ok: true, unlocked: false });
-});
+  return { status: 200, body: { ok: true, unlocked: false, released } };
+}
 
-app.post('/api/admin/login', (req: Req, res: Res) => {
-  const pw = String(req.body?.password || '').trim();
+function opAdminLogin(res: Res, passwordInput: string, didInput: string) {
+  const pw = String(passwordInput || '').trim();
   if (!pw || !safeEqualStr(pw, ADMIN_PASSWORD)) {
-    return res.status(401).json({ error: 'Password admin salah.' });
+    return { status: 401, body: { error: 'Password admin salah.' } };
   }
+  const rawDid = String(didInput || '').trim().slice(0, 64);
+  const deviceId = rawDid || crypto.randomBytes(12).toString('hex');
   const exp = Date.now() + 12 * 3600 * 1000;
-  const adminToken = signSessionPayload({ v: 1, role: 'admin', exp });
-  return res.json({
-    ok: true,
-    adminToken,
-    expiresAt: exp,
-    storage: HAS_SUPABASE ? 'supabase' : 'signed',
-    usingDefaultPassword: USING_DEFAULT_ADMIN_PW,
+  const adminToken = signSessionPayload({ v: 2, role: 'admin', exp });
+  const accessToken = signSessionPayload({
+    v: 2,
+    role: 'admin_listener',
+    code: 'ADMIN',
+    label: 'Admin (Tanpa Kode)',
+    did: deviceId,
+    exp,
   });
-});
+  setAccessCookie(res, accessToken, 12 * 3600);
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      adminToken,
+      accessToken,
+      accessInfo: { label: 'Admin (Tanpa Kode)', code: 'ADMIN', expiresAt: exp },
+      expiresAt: exp,
+      storage: HAS_SUPABASE ? 'supabase' : 'signed',
+      usingDefaultPassword: USING_DEFAULT_ADMIN_PW,
+    },
+  };
+}
 
-app.get('/api/admin/codes', async (req: Req, res: Res) => {
-  if (!requireAdminAuth(req, res)) return;
+async function opAdminListCodes(adminToken: string) {
+  if (!checkAdminToken(adminToken)) return { status: 401, body: { error: 'Unauthorized admin' } };
   try {
     if (HAS_SUPABASE) {
       const r = await sbFetch('access_codes?select=*&order=created_at.desc&limit=100');
       if (!r.ok) {
         const errTxt = await r.text().catch(() => '');
-        return res.status(502).json({ error: `Supabase error (${r.status}): ${errTxt || 'cek tabel access_codes'}` });
+        return { status: 502, body: { error: `Supabase error (${r.status}): ${errTxt || 'cek tabel access_codes'}` } };
       }
       const rows = await r.json();
-      return res.json({
-        storage: 'supabase',
-        usingDefaultPassword: USING_DEFAULT_ADMIN_PW,
-        codes: Array.isArray(rows) ? rows : [],
-      });
+      return {
+        status: 200,
+        body: {
+          storage: 'supabase',
+          usingDefaultPassword: USING_DEFAULT_ADMIN_PW,
+          codes: Array.isArray(rows) ? rows : [],
+        },
+      };
     }
     const codes = Array.from(localCodeStore.values()).sort(
       (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
     );
-    return res.json({
-      storage: 'signed',
-      usingDefaultPassword: USING_DEFAULT_ADMIN_PW,
-      codes,
-    });
+    return {
+      status: 200,
+      body: {
+        storage: 'signed',
+        usingDefaultPassword: USING_DEFAULT_ADMIN_PW,
+        codes,
+      },
+    };
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message || 'Gagal memuat daftar kode' });
+    return { status: 500, body: { error: e?.message || 'Gagal memuat daftar kode' } };
   }
-});
+}
 
-app.post('/api/admin/codes', async (req: Req, res: Res) => {
-  if (!requireAdminAuth(req, res)) return;
+async function opAdminCreateCode(adminToken: string, input: Record<string, any>) {
+  if (!checkAdminToken(adminToken)) return { status: 401, body: { error: 'Unauthorized admin' } };
   try {
-    const rawCustom = String(req.body?.code || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
-    const label = String(req.body?.label || '').trim().slice(0, 60) || 'Pengguna';
-    const maxUses = Math.max(0, Math.min(10000, Number(req.body?.maxUses ?? 1) || 0));
-    const expiresInDays = Number(req.body?.expiresInDays) || 0;
+    const rawCustom = String(input?.code || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+    const label = String(input?.label || '').trim().slice(0, 60) || 'Pengguna';
+    const maxUses = Math.max(0, Math.min(10000, Number(input?.maxUses ?? 1) || 0));
+    const expiresInDays = Number(input?.expiresInDays) || 0;
     const expiresAtMs = expiresInDays > 0 ? Date.now() + expiresInDays * 24 * 3600 * 1000 : null;
     const expires_at = expiresAtMs ? new Date(expiresAtMs).toISOString() : null;
 
     if (HAS_SUPABASE) {
       const code = rawCustom || randomCodeString();
-      if (code.length < 3) return res.status(400).json({ error: 'Kode minimal 3 karakter.' });
+      if (code.length < 3) return { status: 400, body: { error: 'Kode minimal 3 karakter.' } };
       const payload: AccessCodeRecord = {
         code,
         label,
@@ -477,19 +642,18 @@ app.post('/api/admin/codes', async (req: Req, res: Res) => {
       if (!r.ok) {
         const msg = await r.text().catch(() => '');
         if (r.status === 409 || /duplicate/i.test(msg)) {
-          return res.status(409).json({ error: `Kode "${code}" sudah ada.` });
+          return { status: 409, body: { error: `Kode "${code}" sudah ada.` } };
         }
-        return res.status(502).json({ error: `Gagal menyimpan ke Supabase (${r.status})` });
+        return { status: 502, body: { error: `Gagal menyimpan ke Supabase (${r.status})` } };
       }
       const inserted: any = await r.json().catch(() => [payload]);
       codeActiveCache.delete(code);
-      return res.json({ ok: true, code: Array.isArray(inserted) ? inserted[0] : payload });
+      return { status: 200, body: { ok: true, code: Array.isArray(inserted) ? inserted[0] : payload } };
     }
 
-    // Without Supabase: auto-generated codes use HMAC-signed format so they work across serverless cold starts!
     const code = rawCustom || generateSignedCode(expiresAtMs);
-    if (code.length < 3) return res.status(400).json({ error: 'Kode minimal 3 karakter.' });
-    if (localCodeStore.has(code)) return res.status(409).json({ error: `Kode "${code}" sudah ada.` });
+    if (code.length < 3) return { status: 400, body: { error: 'Kode minimal 3 karakter.' } };
+    if (localCodeStore.has(code)) return { status: 409, body: { error: `Kode "${code}" sudah ada.` } };
     const record: AccessCodeRecord = {
       code,
       label,
@@ -504,17 +668,16 @@ app.post('/api/admin/codes', async (req: Req, res: Res) => {
     revokedLocalCodes.delete(code);
     usedSignedDeviceMap.delete(code);
     localCodeStore.set(code, record);
-    return res.json({ ok: true, code: record });
+    return { status: 200, body: { ok: true, code: record } };
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message || 'Gagal membuat kode' });
+    return { status: 500, body: { error: e?.message || 'Gagal membuat kode' } };
   }
-});
+}
 
-app.patch('/api/admin/codes/:code', async (req: Req, res: Res) => {
-  if (!requireAdminAuth(req, res)) return;
-  const code = String(req.params.code || '').trim().toUpperCase();
-  if (!code) return res.status(400).json({ error: 'Kode tidak valid' });
-  const active = Boolean(req.body?.active);
+async function opAdminToggleCode(adminToken: string, rawCode: string, active: boolean) {
+  if (!checkAdminToken(adminToken)) return { status: 401, body: { error: 'Unauthorized admin' } };
+  const code = String(rawCode || '').trim().toUpperCase();
+  if (!code) return { status: 400, body: { error: 'Kode tidak valid' } };
   codeActiveCache.delete(code);
   try {
     if (HAS_SUPABASE) {
@@ -523,38 +686,219 @@ app.patch('/api/admin/codes/:code', async (req: Req, res: Res) => {
         headers: { Prefer: 'return=representation' },
         body: JSON.stringify({ active }),
       });
-      if (!r.ok) return res.status(502).json({ error: 'Gagal mengubah status kode di Supabase' });
+      if (!r.ok) return { status: 502, body: { error: 'Gagal mengubah status kode di Supabase' } };
       const rows: any = await r.json().catch(() => []);
-      return res.json({ ok: true, code: Array.isArray(rows) ? rows[0] : { code, active } });
+      return { status: 200, body: { ok: true, code: Array.isArray(rows) ? rows[0] : { code, active } } };
     }
     const mem = localCodeStore.get(code);
     if (mem) mem.active = active;
     if (active) revokedLocalCodes.delete(code);
     else revokedLocalCodes.add(code);
-    return res.json({ ok: true, code: mem || { code, active } });
+    return { status: 200, body: { ok: true, code: mem || { code, active } } };
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message || 'Gagal update kode' });
+    return { status: 500, body: { error: e?.message || 'Gagal update kode' } };
   }
-});
+}
 
-app.delete('/api/admin/codes/:code', async (req: Req, res: Res) => {
-  if (!requireAdminAuth(req, res)) return;
-  const code = String(req.params.code || '').trim().toUpperCase();
-  if (!code) return res.status(400).json({ error: 'Kode tidak valid' });
+async function opAdminReleaseCode(adminToken: string, rawCode: string) {
+  if (!checkAdminToken(adminToken)) return { status: 401, body: { error: 'Unauthorized admin' } };
+  const code = String(rawCode || '').trim().toUpperCase();
+  if (!code) return { status: 400, body: { error: 'Kode tidak valid' } };
+  codeActiveCache.delete(code);
+  try {
+    if (HAS_SUPABASE) {
+      const r = await sbFetch(`access_codes?code=eq.${encodeURIComponent(code)}`, {
+        method: 'PATCH',
+        headers: { Prefer: 'return=representation' },
+        body: JSON.stringify({ uses: 0, device_id: null }),
+      });
+      if (!r.ok) return { status: 502, body: { error: 'Gagal melepaskan perangkat dari kode di Supabase' } };
+      const rows: any = await r.json().catch(() => []);
+      return { status: 200, body: { ok: true, code: Array.isArray(rows) ? rows[0] : { code, uses: 0, device_id: null } } };
+    }
+    const mem = localCodeStore.get(code);
+    if (mem) {
+      mem.uses = 0;
+      mem.bound_device = null;
+    }
+    usedSignedDeviceMap.delete(code);
+    return { status: 200, body: { ok: true, code: mem || { code, uses: 0, bound_device: null } } };
+  } catch (e: any) {
+    return { status: 500, body: { error: e?.message || 'Gagal mengosongkan kode' } };
+  }
+}
+
+async function opAdminDeleteCode(adminToken: string, rawCode: string) {
+  if (!checkAdminToken(adminToken)) return { status: 401, body: { error: 'Unauthorized admin' } };
+  const code = String(rawCode || '').trim().toUpperCase();
+  if (!code) return { status: 400, body: { error: 'Kode tidak valid' } };
   codeActiveCache.delete(code);
   try {
     if (HAS_SUPABASE) {
       const r = await sbFetch(`access_codes?code=eq.${encodeURIComponent(code)}`, { method: 'DELETE' });
-      if (!r.ok) return res.status(502).json({ error: 'Gagal menghapus kode di Supabase' });
-      return res.json({ ok: true });
+      if (!r.ok) return { status: 502, body: { error: 'Gagal menghapus kode di Supabase' } };
+      return { status: 200, body: { ok: true } };
     }
     revokedLocalCodes.add(code);
     usedSignedDeviceMap.delete(code);
     localCodeStore.delete(code);
-    return res.json({ ok: true });
+    return { status: 200, body: { ok: true } };
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message || 'Gagal menghapus kode' });
+    return { status: 500, body: { error: e?.message || 'Gagal menghapus kode' } };
   }
+}
+
+async function opAdminExtendCode(adminToken: string, rawCode: string, days: number) {
+  if (!checkAdminToken(adminToken)) return { status: 401, body: { error: 'Unauthorized admin' } };
+  const code = String(rawCode || '').trim().toUpperCase();
+  if (!code) return { status: 400, body: { error: 'Kode tidak valid' } };
+  codeActiveCache.delete(code);
+  try {
+    const expiresAtMs = days > 0 ? Date.now() + days * 24 * 3600 * 1000 : null;
+    const expires_at = expiresAtMs ? new Date(expiresAtMs).toISOString() : null;
+    if (HAS_SUPABASE) {
+      const r = await sbFetch(`access_codes?code=eq.${encodeURIComponent(code)}`, {
+        method: 'PATCH',
+        headers: { Prefer: 'return=representation' },
+        body: JSON.stringify({ expires_at }),
+      });
+      if (!r.ok) return { status: 502, body: { error: 'Gagal memperpanjang masa berlaku di Supabase' } };
+      const rows: any = await r.json().catch(() => []);
+      return { status: 200, body: { ok: true, code: Array.isArray(rows) ? rows[0] : { code, expires_at } } };
+    }
+    const mem = localCodeStore.get(code);
+    if (mem) mem.expires_at = expires_at;
+    return { status: 200, body: { ok: true, code: mem || { code, expires_at } } };
+  } catch (e: any) {
+    return { status: 500, body: { error: e?.message || 'Gagal memperpanjang masa berlaku' } };
+  }
+}
+
+/* Encrypted RPC Channel (ECDH P-256 + AES-256-GCM) — hides URLs, passwords, codes, users & payloads in DevTools Network */
+app.get('/api/v1/cfg', (_req: Req, res: Res) => {
+  setNoStore(res);
+  res.json({ p: SERVER_ECDH_PUB_B64U });
+});
+
+app.post('/api/v1/rpc', async (req: Req, res: Res) => {
+  setNoStore(res);
+  try {
+    const { e, k, n, d } = req.body || {};
+    if (e !== 1 || typeof k !== 'string' || typeof n !== 'string' || typeof d !== 'string') {
+      return res.status(400).json({ ok: false });
+    }
+    const clientPubBuf = Buffer.from(k, 'base64url');
+    const ivBuf = Buffer.from(n, 'base64url');
+    const rawBuf = Buffer.from(d, 'base64url');
+    if (clientPubBuf.length !== 65 || ivBuf.length !== 12 || rawBuf.length < 16) {
+      return res.status(400).json({ ok: false });
+    }
+    const sharedSecret = SERVER_ECDH.computeSecret(clientPubBuf);
+    const aesKey = crypto.createHash('sha256').update(Buffer.concat([sharedSecret, clientPubBuf])).digest();
+    const ctBuf = rawBuf.subarray(0, rawBuf.length - 16);
+    const tagBuf = rawBuf.subarray(rawBuf.length - 16);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', aesKey, ivBuf);
+    decipher.setAuthTag(tagBuf);
+    const plainJson = Buffer.concat([decipher.update(ctBuf), decipher.final()]).toString('utf8');
+    const rpc = JSON.parse(plainJson);
+    const act = String(rpc?.a || '');
+    const p = (rpc?.p && typeof rpc.p === 'object' ? rpc.p : {}) as Record<string, any>;
+    const tok = typeof rpc?.tok === 'string' ? rpc.tok : '';
+    const auth = typeof rpc?.auth === 'string' ? rpc.auth : '';
+    const did = typeof rpc?.did === 'string' ? rpc.did : '';
+
+    let out: { status: number; body: Record<string, any> };
+    if (act === 's') out = await opAccessStatus(req, tok, did);
+    else if (act === 'v') out = await opAccessVerify(res, p.code, p.deviceId || did);
+    else if (act === 'l') out = await opAccessLock(req, res, tok, did);
+    else if (act === 'al') out = opAdminLogin(res, p.password, p.deviceId || did);
+    else if (act === 'ac') out = await opAdminListCodes(auth);
+    else if (act === 'ak') out = await opAdminCreateCode(auth, p);
+    else if (act === 'at') out = await opAdminToggleCode(auth, p.code, Boolean(p.active));
+    else if (act === 'ar') out = await opAdminReleaseCode(auth, p.code);
+    else if (act === 'ad') out = await opAdminDeleteCode(auth, p.code);
+    else if (act === 'ae') out = await opAdminExtendCode(auth, p.code, Number(p.days) || 0);
+    else out = { status: 400, body: { error: 'Unknown action' } };
+
+    const respPlain = JSON.stringify({ status: out.status, ...out.body });
+    const respIv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', aesKey, respIv);
+    const respEnc = Buffer.concat([cipher.update(respPlain, 'utf8'), cipher.final()]);
+    const respTag = cipher.getAuthTag();
+    return res.json({
+      e: 1,
+      n: respIv.toString('base64url'),
+      d: Buffer.concat([respEnc, respTag]).toString('base64url'),
+    });
+  } catch {
+    return res.status(400).json({ ok: false });
+  }
+});
+
+app.get('/api/access/status', async (req: Req, res: Res) => {
+  setNoStore(res);
+  const out = await opAccessStatus(req);
+  return res.status(out.status).json(out.body);
+});
+
+app.post('/api/access/verify', async (req: Req, res: Res) => {
+  setNoStore(res);
+  const rawDid = String(req.body?.deviceId || req.headers['x-device-id'] || '');
+  const out = await opAccessVerify(res, String(req.body?.code || ''), rawDid);
+  return res.status(out.status).json(out.body);
+});
+
+app.post('/api/access/lock', async (req: Req, res: Res) => {
+  setNoStore(res);
+  const out = await opAccessLock(req, res);
+  return res.status(out.status).json(out.body);
+});
+
+app.post('/api/admin/login', (req: Req, res: Res) => {
+  setNoStore(res);
+  const rawDid = String(req.body?.deviceId || req.headers['x-device-id'] || '');
+  const out = opAdminLogin(res, String(req.body?.password || ''), rawDid);
+  return res.status(out.status).json(out.body);
+});
+
+app.get('/api/admin/codes', async (req: Req, res: Res) => {
+  setNoStore(res);
+  const auth = String(req.headers.authorization || '');
+  const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  const out = await opAdminListCodes(token);
+  return res.status(out.status).json(out.body);
+});
+
+app.post('/api/admin/codes', async (req: Req, res: Res) => {
+  setNoStore(res);
+  const auth = String(req.headers.authorization || '');
+  const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  const out = await opAdminCreateCode(token, req.body || {});
+  return res.status(out.status).json(out.body);
+});
+
+app.patch('/api/admin/codes/:code', async (req: Req, res: Res) => {
+  setNoStore(res);
+  const auth = String(req.headers.authorization || '');
+  const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  const out = await opAdminToggleCode(token, String(req.params.code || ''), Boolean(req.body?.active));
+  return res.status(out.status).json(out.body);
+});
+
+app.post('/api/admin/codes/:code/release', async (req: Req, res: Res) => {
+  setNoStore(res);
+  const auth = String(req.headers.authorization || '');
+  const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  const out = await opAdminReleaseCode(token, String(req.params.code || ''));
+  return res.status(out.status).json(out.body);
+});
+
+app.delete('/api/admin/codes/:code', async (req: Req, res: Res) => {
+  setNoStore(res);
+  const auth = String(req.headers.authorization || '');
+  const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  const out = await opAdminDeleteCode(token, String(req.params.code || ''));
+  return res.status(out.status).json(out.body);
 });
 
 
@@ -1255,6 +1599,22 @@ async function browsePage(rawId: string, params?: string) {
     if (items.length && items.filter((i: any) => i.videoId).length >= items.length / 2 && !tracks.length) {
       tracks = items;
     }
+  }
+
+  // Fetch continuation pages for playlist / album tracks
+  let cTok = continuationToken(d);
+  let pageCount = 0;
+  while (cTok && pageCount < 4 && tracks.length < 350) {
+    const dCont = await yt('browse', { continuation: cTok }).catch(() => null);
+    if (!dCont) break;
+    const addedItems = continuationContents(dCont);
+    const parsedCont = addedItems
+      .map((c: any) => (c.musicResponsiveListItemRenderer ? parseListItem(c.musicResponsiveListItemRenderer) : null))
+      .filter((x: any) => x && x.title && x.videoId);
+    if (!parsedCont.length) break;
+    tracks = tracks.concat(parsedCont);
+    cTok = continuationToken(dCont);
+    pageCount++;
   }
 
   const sl = findFirst(d, 'sectionListRenderer');
